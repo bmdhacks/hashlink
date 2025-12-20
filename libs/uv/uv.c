@@ -310,3 +310,60 @@ DEFINE_PRIM(_I32, loop_alive_wrap, _LOOP);
 DEFINE_PRIM(_VOID, stop_wrap, _LOOP);
 
 DEFINE_PRIM(_BYTES, strerror, _I32);
+
+// DNS resolve
+
+static void on_resolve(uv_getaddrinfo_t *req, int status, struct addrinfo *res) {
+	vclosure *callback = (vclosure *)req->data;
+
+	hl_remove_root(&req->data);
+
+	int ipv4_addr = 0;
+	vbyte *ipv6_bytes = NULL;
+
+	if (status == 0 && res != NULL) {
+		if (res->ai_family == AF_INET) {
+			struct sockaddr_in *addr = (struct sockaddr_in *)res->ai_addr;
+			ipv4_addr = *(int *)&addr->sin_addr;
+		} else if (res->ai_family == AF_INET6) {
+			struct sockaddr_in6 *addr = (struct sockaddr_in6 *)res->ai_addr;
+			// Copy first 8 bytes of IPv6 address (matches original behavior)
+			ipv6_bytes = hl_copy_bytes((vbyte *)&addr->sin6_addr, 8);
+		} else {
+			hl_throw(hl_alloc_strbytes(USTR("Unsupported address family")));
+		}
+	}
+
+	if (callback) {
+		vdynamic args[3];
+		vdynamic *pargs[3] = { &args[0], &args[1], &args[2] };
+		args[0].t = &hlt_i32;
+		args[0].v.i = status;
+		args[1].t = &hlt_i32;
+		args[1].v.i = ipv4_addr;
+		args[2].t = &hlt_bytes;
+		args[2].v.ptr = ipv6_bytes;
+		hl_dyn_call(callback, pargs, 3);
+	}
+
+	if (res) uv_freeaddrinfo(res);
+	free(req);
+}
+
+HL_PRIM bool HL_NAME(resolve)(uv_loop_t *loop, vbyte *hostname, int hint, vclosure *callback) {
+	uv_getaddrinfo_t *req = (uv_getaddrinfo_t *)malloc(sizeof(uv_getaddrinfo_t));
+
+	req->data = callback;
+	hl_add_root(&req->data);
+
+	// Note: hint parameter is ignored (matches original behavior)
+	int r = uv_getaddrinfo(loop, req, on_resolve, (const char *)hostname, NULL, NULL);
+	if (r < 0) {
+		hl_remove_root(&req->data);
+		free(req);
+		return false;
+	}
+	return true;
+}
+
+DEFINE_PRIM(_BOOL, resolve, _LOOP _BYTES _I32 _FUN(_VOID, _I32 _I32 _BYTES));
