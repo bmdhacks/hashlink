@@ -669,6 +669,8 @@ static void str_stack_fp(jit_ctx *ctx, Arm64FpReg src, int stack_offset, int siz
  * This allows individual STPs to be patched to NOPs without affecting SP.
  */
 static void stp_offset(jit_ctx *ctx, Arm64Reg rt, Arm64Reg rt2, Arm64Reg rn, int offset) {
+	// STP imm7 is signed, scaled by 8: range -512 to +504
+	if (offset < -512 || offset > 504) hl_fatal("stp_offset: offset out of range");
 	int imm7 = offset / 8;
 	// opc=10 (64-bit), 101, addr_mode=10 (signed offset), L=0 (store), imm7, Rt2, Rn, Rt
 	unsigned int insn = (2u << 30) | (5u << 27) | (2u << 23) | (0u << 22) |
@@ -1641,6 +1643,11 @@ static void op_jump(jit_ctx *ctx, vreg *a, vreg *b, hl_op op, int target_opcode)
 		} else {
 			jit_error("Unsupported comparison op for HNULL");
 		}
+		// Clear register bindings - the registers now contain dereferenced inner values,
+		// not the original Null<T> pointers. Without this, subsequent ops would think
+		// pa/pb still hold the original vregs, causing use of stale/wrong values.
+		discard(ctx, pa);
+		discard(ctx, pb);
 		return;
 	}
 
@@ -1725,6 +1732,8 @@ static void op_jump(jit_ctx *ctx, vreg *a, vreg *b, hl_op op, int target_opcode)
 			} else {
 				jit_error("Unsupported comparison op for HVIRTUAL vs HOBJ");
 			}
+			// Clear register bindings - ra now contains a->value, not a
+			discard(ctx, pa);
 			return;
 		}
 
@@ -1813,6 +1822,9 @@ static void op_jump(jit_ctx *ctx, vreg *a, vreg *b, hl_op op, int target_opcode)
 		} else {
 			jit_error("Unsupported comparison op for HVIRTUAL");
 		}
+		// Clear register bindings - ra/rb now contain ->value, not the original vregs
+		discard(ctx, pa);
+		discard(ctx, pb);
 		return;
 	}
 
@@ -5389,8 +5401,9 @@ int hl_jit_function(jit_ctx *ctx, hl_module *m, hl_function *f) {
 				args[i] = R(reg_id);
 			}
 			// Debug: check for corrupt vreg pointers
+			// ARM64 user space extends to 0x0000ffffffffffff (48-bit VA)
 			for (int i = 0; i < nargs; i++) {
-				if ((unsigned long)args[i] < 0x1000 || (unsigned long)args[i] > 0x7fffffffffff) {
+				if ((unsigned long)args[i] < 0x1000 || (unsigned long)args[i] > 0x0000ffffffffffff) {
 					printf("JIT ERROR: OCallThis: corrupt vreg pointer at args[%d] = %p\n", i, args[i]);
 					jit_exit();
 				}
@@ -6418,15 +6431,14 @@ int hl_jit_function(jit_ctx *ctx, hl_module *m, hl_function *f) {
 			// Allocate closure: hl_alloc_closure_ptr(type, func, obj)
 			// First get the function pointer from vtable
 			ldr_stack(ctx, X2, ra->stackPos, ra->size);  // obj -> X2
-			// Load vtable: X9 = obj->t (first field)
+			// Load type: X9 = obj->t (first field)
 			encode_ldr_str_imm(ctx, 0x03, 0, 0x01, 0, X2, X9);
-			// Load runtime obj: X9 = ((hl_type*)X9)->obj->rt
-			encode_ldr_str_imm(ctx, 0x03, 0, 0x01, FIELD_OFFSET_SCALED(hl_type, obj), X9, X9);
-			encode_ldr_str_imm(ctx, 0x03, 0, 0x01, FIELD_OFFSET_SCALED(hl_type_obj, rt), X9, X9);
-			// Load method from vtable: X1 = rt->methods[pindex]
-			int method_offset = HL_WSIZE * 2 + o->p3 * HL_WSIZE;  // Skip hasPtr and nFields
+			// Load vobj_proto: X9 = type->vobj_proto (offset 16, like x86)
+			encode_ldr_str_imm(ctx, 0x03, 0, 0x01, 2, X9, X9);  // offset 16/8 = 2
+			// Load method from vtable: X1 = vobj_proto[pindex]
+			int method_offset = o->p3 * HL_WSIZE;
 			if (method_offset < 4096) {
-				encode_ldr_str_imm(ctx, 0x03, 0, 0x01, method_offset / 8, X9, X1);
+				encode_ldr_str_imm(ctx, 0x03, 0, 0x01, o->p3, X9, X1);
 			} else {
 				load_immediate(ctx, method_offset, RTMP, true);
 				encode_ldr_str_reg(ctx, 0x03, 0, 0x01, RTMP, 0x03, 0, X9, X1);
