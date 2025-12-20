@@ -3,7 +3,9 @@ add_library(sdl.hdll
     gl.c
 )
 
-if ((NOT WIN32) AND DOWNLOAD_DEPENDENCIES)
+option(USE_SYSTEM_SDL2 "Use system SDL2 instead of downloading" ON)
+
+if ((NOT WIN32) AND DOWNLOAD_DEPENDENCIES AND (NOT USE_SYSTEM_SDL2))
     FetchContent_Declare(
         SDL2
         URL https://github.com/libsdl-org/SDL/releases/download/release-2.32.8/SDL2-2.32.8.tar.gz
