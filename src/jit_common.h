@@ -116,9 +116,12 @@ struct _jit_ctx {
 	bool static_function_offset;
 #ifdef HL_64
 	// Phase 2: Callee-saved register optimization (AArch64 only)
-	unsigned int callee_saved_used;   // Bitmap: bit i = 1 if callee-saved reg i is used
-	int stp_positions[5];             // Positions of 5 STP instructions for backpatching
-	int ldp_positions[5];             // Positions of 5 LDP instructions for backpatching
+	unsigned int callee_saved_used;       // Bitmap: bit i = 1 if CPU callee-saved reg i used
+	unsigned int fpu_callee_saved_used;   // Bitmap: bit i = 1 if FPU callee-saved reg i used
+	int stp_positions[5];                 // CPU STP positions (5 pairs: X19-X28)
+	int ldp_positions[5];                 // CPU LDP positions
+	int stp_fpu_positions[4];             // FPU STP positions (4 pairs: V8-V15)
+	int ldp_fpu_positions[4];             // FPU LDP positions
 #endif
 };
 

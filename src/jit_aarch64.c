@@ -109,17 +109,18 @@ static const Arm64Reg RCPU_CALLEE_ALLOC[] = {
 	X19, X20, X21, X22, X23, X24, X25, X26, X27, X28
 };
 
-// Frame size for callee-saved registers + FP/LR
-// Callee-saved: RCPU_CALLEE_SAVED_COUNT * 8 bytes = 80 bytes
-// FP/LR: 16 bytes
-// Total: 96 bytes (must be 16-byte aligned)
-#define CALLEE_SAVED_FRAME_SIZE (RCPU_CALLEE_SAVED_COUNT * 8 + 16)
-
-// FP callee-saved: V8-V15 (only lower 64 bits)
+// FP callee-saved: V8-V15 (only lower 64 bits per AAPCS64)
 #define RFPU_CALLEE_SAVED_COUNT 8
 static const Arm64FpReg RFPU_CALLEE_SAVED[] = {
 	V8, V9, V10, V11, V12, V13, V14, V15
 };
+
+// Frame size for callee-saved registers + FP/LR
+// CPU callee-saved: RCPU_CALLEE_SAVED_COUNT * 8 bytes = 80 bytes
+// FPU callee-saved: RFPU_CALLEE_SAVED_COUNT * 8 bytes = 64 bytes (D8-D15, lower 64 bits only)
+// FP/LR: 16 bytes
+// Total: 160 bytes (must be 16-byte aligned)
+#define CALLEE_SAVED_FRAME_SIZE (RCPU_CALLEE_SAVED_COUNT * 8 + RFPU_CALLEE_SAVED_COUNT * 8 + 16)
 
 // Helper macros for accessing registers
 #define REG_COUNT (RCPU_COUNT + RFPU_COUNT)
@@ -311,14 +312,19 @@ static preg *alloc_fpu(jit_ctx *ctx) {
 	// Second pass: try callee-saved if needed
 	for (i = 8; i < 16; i++) {
 		p = PVFPR(i);
-		if (p->holds == NULL && p->lock < ctx->currentPos)
+		if (p->holds == NULL && p->lock < ctx->currentPos) {
+			ctx->fpu_callee_saved_used |= (1 << (i - 8));  // Track V8-V15 usage
 			return p;
+		}
 	}
 
 	// Third pass: evict an unlocked register
 	for (i = 0; i < RFPU_COUNT; i++) {
 		p = PVFPR(i);
 		if (p->lock < ctx->currentPos) {
+			if (i >= 8 && i < 16) {
+				ctx->fpu_callee_saved_used |= (1 << (i - 8));  // Track V8-V15 usage
+			}
 			free_reg(ctx, p);  // Spill to stack before reusing
 			return p;
 		}
@@ -692,6 +698,33 @@ static void ldp_offset(jit_ctx *ctx, Arm64Reg rt, Arm64Reg rt2, Arm64Reg rn, int
 	int imm7 = offset / 8;
 	// opc=10 (64-bit), 101, addr_mode=10 (signed offset), L=1 (load), imm7, Rt2, Rn, Rt
 	unsigned int insn = (2u << 30) | (5u << 27) | (2u << 23) | (1u << 22) |
+	                    ((imm7 & 0x7F) << 15) | (rt2 << 10) | (rn << 5) | rt;
+	EMIT32(ctx, insn);
+}
+
+/**
+ * STP for 64-bit FP registers (D regs) with signed offset.
+ * Format: STP Dt1, Dt2, [Xn, #imm]
+ * Encoding: opc=01 (64-bit FP), V=1, addr_mode=10
+ * Verified: arm-enc "stp d8, d9, [sp, #96]" -> 0x6d0627e8
+ */
+static void stp_offset_fp(jit_ctx *ctx, Arm64FpReg rt, Arm64FpReg rt2, Arm64Reg rn, int offset) {
+	if (offset < -512 || offset > 504) hl_fatal("stp_offset_fp: offset out of range");
+	int imm7 = offset / 8;
+	// opc=01 (64-bit FP), 101, V=1, addr_mode=10, L=0
+	unsigned int insn = (1u << 30) | (5u << 27) | (1u << 26) | (2u << 23) | (0u << 22) |
+	                    ((imm7 & 0x7F) << 15) | (rt2 << 10) | (rn << 5) | rt;
+	EMIT32(ctx, insn);
+}
+
+/**
+ * LDP for 64-bit FP registers (D regs) with signed offset.
+ * Verified: arm-enc "ldp d14, d15, [sp, #144]" -> 0x6d493fee
+ */
+static void ldp_offset_fp(jit_ctx *ctx, Arm64FpReg rt, Arm64FpReg rt2, Arm64Reg rn, int offset) {
+	int imm7 = offset / 8;
+	// opc=01 (64-bit FP), 101, V=1, addr_mode=10, L=1
+	unsigned int insn = (1u << 30) | (5u << 27) | (1u << 26) | (2u << 23) | (1u << 22) |
 	                    ((imm7 & 0x7F) << 15) | (rt2 << 10) | (rn << 5) | rt;
 	EMIT32(ctx, insn);
 }
@@ -4428,8 +4461,11 @@ int hl_jit_function(jit_ctx *ctx, hl_module *m, hl_function *f) {
 
 	// Initialize Phase 2 callee-saved tracking
 	ctx->callee_saved_used = 0;
+	ctx->fpu_callee_saved_used = 0;
 	memset(ctx->stp_positions, 0, sizeof(ctx->stp_positions));
 	memset(ctx->ldp_positions, 0, sizeof(ctx->ldp_positions));
+	memset(ctx->stp_fpu_positions, 0, sizeof(ctx->stp_fpu_positions));
+	memset(ctx->ldp_fpu_positions, 0, sizeof(ctx->ldp_fpu_positions));
 
 	// Function prologue - offset-based for selective NOP patching (Phase 2)
 	// Reserve space for callee-saved registers + FP/LR
@@ -4450,6 +4486,19 @@ int hl_jit_function(jit_ctx *ctx, hl_module *m, hl_function *f) {
 
 	ctx->stp_positions[4] = BUF_POS();
 	stp_offset(ctx, X19, X20, SP_REG, 16);  // STP X19, X20, [SP, #16]
+
+	// Save FPU callee-saved at fixed offsets (NOPpable)
+	ctx->stp_fpu_positions[0] = BUF_POS();
+	stp_offset_fp(ctx, V8, V9, SP_REG, 96);    // STP D8, D9, [SP, #96]
+
+	ctx->stp_fpu_positions[1] = BUF_POS();
+	stp_offset_fp(ctx, V10, V11, SP_REG, 112); // STP D10, D11, [SP, #112]
+
+	ctx->stp_fpu_positions[2] = BUF_POS();
+	stp_offset_fp(ctx, V12, V13, SP_REG, 128); // STP D12, D13, [SP, #128]
+
+	ctx->stp_fpu_positions[3] = BUF_POS();
+	stp_offset_fp(ctx, V14, V15, SP_REG, 144); // STP D14, D15, [SP, #144]
 
 	// Save FP/LR at bottom (NOT NOPpable - always needed)
 	stp_offset(ctx, FP, LR, SP_REG, 0);     // STP X29, X30, [SP, #0]
@@ -6514,7 +6563,20 @@ int hl_jit_function(jit_ctx *ctx, hl_module *m, hl_function *f) {
 	// Restore FP/LR from bottom (NOT NOPpable - always needed)
 	ldp_offset(ctx, FP, LR, SP_REG, 0);  // LDP X29, X30, [SP, #0]
 
-	// Restore callee-saved - record positions for potential NOPping
+	// Restore FPU callee-saved (NOPpable) - reverse order of saves
+	ctx->ldp_fpu_positions[3] = BUF_POS();
+	ldp_offset_fp(ctx, V14, V15, SP_REG, 144); // LDP D14, D15, [SP, #144]
+
+	ctx->ldp_fpu_positions[2] = BUF_POS();
+	ldp_offset_fp(ctx, V12, V13, SP_REG, 128); // LDP D12, D13, [SP, #128]
+
+	ctx->ldp_fpu_positions[1] = BUF_POS();
+	ldp_offset_fp(ctx, V10, V11, SP_REG, 112); // LDP D10, D11, [SP, #112]
+
+	ctx->ldp_fpu_positions[0] = BUF_POS();
+	ldp_offset_fp(ctx, V8, V9, SP_REG, 96);    // LDP D8, D9, [SP, #96]
+
+	// Restore CPU callee-saved - record positions for potential NOPping
 	ctx->ldp_positions[4] = BUF_POS();
 	ldp_offset(ctx, X19, X20, SP_REG, 16);  // LDP X19, X20, [SP, #16]
 
@@ -6548,7 +6610,7 @@ int hl_jit_function(jit_ctx *ctx, hl_module *m, hl_function *f) {
 		ctx->jumps = NULL;
 	}
 
-	// Phase 2: Backpatch unused callee-saved register saves/restores to NOPs
+	// Phase 2a: Backpatch unused CPU callee-saved register saves/restores to NOPs
 	// Each STP/LDP handles a pair: [0]=X27,X28  [1]=X25,X26  [2]=X23,X24  [3]=X21,X22  [4]=X19,X20
 	// Bitmap bits: 0,1=X19,X20  2,3=X21,X22  4,5=X23,X24  6,7=X25,X26  8,9=X27,X28
 	{
@@ -6559,6 +6621,23 @@ int hl_jit_function(jit_ctx *ctx, hl_module *m, hl_function *f) {
 				// Neither register in pair was used - NOP both save and restore
 				unsigned int *stp_code = (unsigned int*)(ctx->startBuf + ctx->stp_positions[i]);
 				unsigned int *ldp_code = (unsigned int*)(ctx->startBuf + ctx->ldp_positions[i]);
+				*stp_code = 0xD503201F;  // NOP
+				*ldp_code = 0xD503201F;  // NOP
+			}
+		}
+	}
+
+	// Phase 2b: Backpatch unused FPU callee-saved register saves/restores to NOPs
+	// Pairs: [0]=V8,V9  [1]=V10,V11  [2]=V12,V13  [3]=V14,V15
+	// Bitmap: bits 0,1=V8,V9  bits 2,3=V10,V11  bits 4,5=V12,V13  bits 6,7=V14,V15
+	{
+		int i;
+		for (i = 0; i < 4; i++) {
+			int pair_mask = 3 << (i * 2);
+			if (!(ctx->fpu_callee_saved_used & pair_mask)) {
+				// Neither register in pair was used - NOP both save and restore
+				unsigned int *stp_code = (unsigned int*)(ctx->startBuf + ctx->stp_fpu_positions[i]);
+				unsigned int *ldp_code = (unsigned int*)(ctx->startBuf + ctx->ldp_fpu_positions[i]);
 				*stp_code = 0xD503201F;  // NOP
 				*ldp_code = 0xD503201F;  // NOP
 			}
