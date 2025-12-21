@@ -647,9 +647,97 @@ void encode_cond_select(jit_ctx *ctx, int sf, int op, Arm64Reg Rm, ArmCondition 
 // High-Level Helper Functions
 // ============================================================================
 
+// ----------------------------------------------------------------------------
+// Logical Immediate Encoding Helpers
+// ----------------------------------------------------------------------------
+
+/**
+ * Rotate a 64-bit value right by the specified amount
+ */
+static inline uint64_t rotate_right_64(uint64_t val, int rotation) {
+	return (val >> (rotation & 63)) | (val << ((-rotation) & 63));
+}
+
+/**
+ * Check if a 64-bit value can be encoded as a logical immediate
+ * and compute the N, immr, imms fields if so.
+ *
+ * Based on the optimized algorithm from dougallj:
+ * https://dougallj.wordpress.com/2021/10/30/
+ *
+ * AArch64 logical immediates can represent bitmask patterns consisting of
+ * a single run of 1-bits, optionally rotated, and replicated across element
+ * sizes of 2, 4, 8, 16, 32, or 64 bits.
+ *
+ * @param val   The 64-bit value to check
+ * @param N     Output: N field (1 for 64-bit element, 0 otherwise)
+ * @param immr  Output: rotation amount field (6 bits)
+ * @param imms  Output: element size/ones encoding field (6 bits)
+ * @return      true if value is encodable, false otherwise
+ */
+static bool is_logical_immediate_64(uint64_t val, int *N, int *immr, int *imms) {
+	// All-zeros and all-ones cannot be encoded
+	if (val == 0 || ~val == 0)
+		return false;
+
+	// Find rotation to normalize the pattern
+	// val & (val + 1) clears trailing ones; ctz gives rotation amount
+	// Handle the case where val is all trailing ones (ctzll(0) is undefined)
+	uint64_t tmp = val & (val + 1);
+	int rotation = (tmp == 0) ? 0 : __builtin_ctzll(tmp);
+	uint64_t normalized = rotate_right_64(val, rotation);
+
+	// Count leading zeros and trailing ones in normalized form
+	int zeroes = __builtin_clzll(normalized);
+	int ones = __builtin_ctzll(~normalized);
+	int size = zeroes + ones;
+
+	// Validate: pattern must repeat when rotated by size
+	// This also implicitly checks that size is a power of 2
+	if (rotate_right_64(val, size) != val)
+		return false;
+
+	// Encode the fields
+	*immr = (-rotation) & (size - 1);
+	*imms = ((-(size << 1)) | (ones - 1)) & 0x3f;
+	*N = (size >> 6);
+
+	return true;
+}
+
+/**
+ * Check if a 32-bit value can be encoded as a logical immediate
+ * for 32-bit operations (where N must be 0).
+ *
+ * @param val   The 32-bit value to check
+ * @param N     Output: N field (must be 0 for 32-bit)
+ * @param immr  Output: rotation amount field
+ * @param imms  Output: element size/ones encoding field
+ * @return      true if value is encodable, false otherwise
+ */
+static bool is_logical_immediate_32(uint32_t val, int *N, int *immr, int *imms) {
+	// All-zeros and all-ones cannot be encoded
+	if (val == 0 || val == 0xFFFFFFFF)
+		return false;
+
+	// Replicate 32-bit pattern to 64-bit for encoding calculation
+	uint64_t val64 = ((uint64_t)val << 32) | val;
+
+	if (!is_logical_immediate_64(val64, N, immr, imms))
+		return false;
+
+	// For 32-bit operations, N must be 0 (element size <= 32)
+	if (*N != 0)
+		return false;
+
+	return true;
+}
+
+// ----------------------------------------------------------------------------
+
 /**
  * Load an immediate value into a register
- * Uses MOVZ/MOVK sequence for multi-halfword values
+ * Uses logical immediate (ORR) when possible, otherwise MOVZ/MOVK sequence
  *
  * @param val       64-bit immediate value
  * @param dst       Destination register
@@ -687,6 +775,21 @@ void load_immediate(jit_ctx *ctx, int64_t val, Arm64Reg dst, bool is_64bit) {
 	if (val > 0 && val <= 65535) {
 		encode_mov_wide_imm(ctx, sf, 0x02, 0, (int)val, dst);
 		return;
+	}
+
+	// Try logical immediate encoding: ORR Xd, XZR, #imm
+	// This can load many bitmask patterns with a single instruction
+	{
+		int N, immr, imms;
+		bool can_encode = is_64bit
+			? is_logical_immediate_64((uint64_t)val, &N, &immr, &imms)
+			: is_logical_immediate_32((uint32_t)val, &N, &immr, &imms);
+
+		if (can_encode) {
+			// ORR Xd, XZR, #imm  (opc=0x01 for ORR)
+			encode_logical_imm(ctx, sf, 0x01, N, immr, imms, XZR, dst);
+			return;
+		}
 	}
 
 	// Count which halfwords are non-zero
