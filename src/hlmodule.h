@@ -127,6 +127,7 @@ typedef struct {
 	hl_code_hash *hash;
 	hl_debug_infos *jit_debug;
 	jit_ctx *jit_ctx;
+	void *jit_handle;  /* dlopen handle for ELF debug mode */
 	hl_module_context ctx;
 } hl_module;
 

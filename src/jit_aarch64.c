@@ -41,8 +41,12 @@
 #include <math.h>
 #include <string.h>
 #include <stddef.h>
+#include <unistd.h>
+#include <dlfcn.h>
+#include <sys/mman.h>
 #include "jit_common.h"
 #include "jit_aarch64_emit.h"
+#include "jit_elf.h"
 #include "hlsystem.h"
 
 // Helper for LDR/STR scaled offset from struct field
@@ -6730,12 +6734,73 @@ static void write_jit_debug_file(jit_ctx *ctx, hl_module *m, void *code, int cod
 	fprintf(stderr, "JIT debug info written to: %s\n", path);
 }
 
+/**
+ * Write perf map for profiler symbol resolution (heaptrack, perf, etc).
+ * Triggered by HL_PERF_MAP environment variable.
+ * Format: <hex_addr> <hex_size> <name> (no 0x prefix)
+ */
+static void write_perf_map(jit_ctx *ctx, hl_module *m, void *code) {
+	if (!getenv("HL_PERF_MAP")) return;
+
+	char path[64];
+	snprintf(path, sizeof(path), "/tmp/perf-%d.map", getpid());
+	FILE *fp = fopen(path, "w");
+	if (!fp) {
+		fprintf(stderr, "Warning: Could not create perf map: %s\n", path);
+		return;
+	}
+
+	for (int i = 0; i < m->code->nfunctions; i++) {
+		hl_function *f = &m->code->functions[i];
+		hl_debug_infos *dbg = &ctx->debug[i];
+		if (!dbg->offsets) continue;
+
+		void *start = (char*)code + dbg->start;
+		int size = dbg->large ?
+			((int*)dbg->offsets)[f->nops] :
+			((unsigned short*)dbg->offsets)[f->nops];
+
+		// Build function name from hl_function structure
+		// Similar to module.c:hl_module_resolve_symbol_full()
+		if (f->obj) {
+			// Method: ClassName.methodName
+			char *cls = hl_to_utf8(f->obj->name);
+			char *meth = hl_to_utf8(f->field.name);
+			fprintf(fp, "%lx %x %s.%s\n", (uintptr_t)start, size, cls, meth);
+		} else if (f->field.ref) {
+			// Closure: ClassName.~parentMethod.closureIndex
+			char *cls = hl_to_utf8(f->field.ref->obj->name);
+			char *meth = hl_to_utf8(f->field.ref->field.name);
+			fprintf(fp, "%lx %x %s.~%s.%d\n", (uintptr_t)start, size, cls, meth, f->ref);
+		} else {
+			// Anonymous function
+			fprintf(fp, "%lx %x fun$%d\n", (uintptr_t)start, size, f->findex);
+		}
+	}
+
+	// Also add native functions if available
+	for (int i = 0; i < m->code->nnatives; i++) {
+		hl_native *n = &m->code->natives[i];
+		if (m->functions_ptrs && m->functions_ptrs[n->findex]) {
+			// Native functions - size unknown, use placeholder
+			fprintf(fp, "%lx 1 %s@%s\n",
+				(uintptr_t)m->functions_ptrs[n->findex],
+				n->name, n->lib);
+		}
+	}
+
+	fclose(fp);
+	fprintf(stderr, "Perf map written to: %s\n", path);
+}
+
 void *hl_jit_code(jit_ctx *ctx, hl_module *m, int *codesize, hl_debug_infos **debug, hl_module *previous) {
 	int code_size = BUF_POS();
 	unsigned char *code;
 	jlist *j;
     unsigned int *insn_ptr;
     unsigned int insn;
+	int use_elf_debug = getenv("HL_JIT_DEBUG") != NULL;
+	void *elf_handle = NULL;
 
 	// Round up code size to page boundary for memory allocation
 	int alloc_size = (code_size + 4095) & ~4095;
@@ -6743,7 +6808,31 @@ void *hl_jit_code(jit_ctx *ctx, hl_module *m, int *codesize, hl_debug_infos **de
 	// Note: Jump patching is now done at the end of each function in jit_function()
 	// This ensures ctx->opsPos contains the correct positions for each function's jumps
 
-	// Allocate executable memory
+	if (use_elf_debug) {
+		// Debug path: write ELF and dlopen for profiler/debugger support
+		char path[64];
+		snprintf(path, sizeof(path), "/tmp/hl-jit-%d.so", getpid());
+
+		if (write_jit_elf(path, ctx, m, code_size, ctx->startBuf)) {
+			elf_handle = dlopen(path, RTLD_NOW);
+			if (elf_handle) {
+				code = (unsigned char*)dlsym(elf_handle, "_hl_jit_code");
+				if (code) {
+					// Store handle for cleanup
+					m->jit_handle = elf_handle;
+					fprintf(stderr, "JIT ELF written to: %s (loaded at %p)\n", path, code);
+					goto do_patching;
+				}
+				fprintf(stderr, "dlsym failed for _hl_jit_code\n");
+				dlclose(elf_handle);
+			} else {
+				fprintf(stderr, "dlopen failed: %s\n", dlerror());
+			}
+		}
+		fprintf(stderr, "ELF debug mode failed, falling back to mmap\n");
+	}
+
+	// Default path: allocate executable memory directly
 	code = (unsigned char*)hl_alloc_executable_memory(alloc_size);
 	if (code == NULL) {
 		printf("JIT Error: Failed to allocate executable memory (%d bytes)\n", alloc_size);
@@ -6752,6 +6841,16 @@ void *hl_jit_code(jit_ctx *ctx, hl_module *m, int *codesize, hl_debug_infos **de
 
 	// Copy generated code to executable memory (with jumps already patched)
 	memcpy(code, ctx->startBuf, code_size);
+
+do_patching:
+	// If using ELF debug mode, make code writable for patching
+	if (elf_handle) {
+		uintptr_t page_start = (uintptr_t)code & ~0xFFFFUL;  // 64KB page alignment
+		size_t page_size = ((uintptr_t)code + code_size - page_start + 0xFFFF) & ~0xFFFFUL;
+		if (mprotect((void*)page_start, page_size, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+			fprintf(stderr, "mprotect RWX failed for patching\n");
+		}
+	}
 
 	// Set up C↔HL trampolines and callbacks
 	if (!call_jit_c2hl) {
@@ -6858,6 +6957,15 @@ void *hl_jit_code(jit_ctx *ctx, hl_module *m, int *codesize, hl_debug_infos **de
 		ctx->closure_list = NULL;
 	}
 
+	// If using ELF debug mode, restore code to read-only after patching
+	if (elf_handle) {
+		uintptr_t page_start = (uintptr_t)code & ~0xFFFFUL;
+		size_t page_size = ((uintptr_t)code + code_size - page_start + 0xFFFF) & ~0xFFFFUL;
+		if (mprotect((void*)page_start, page_size, PROT_READ | PROT_EXEC) != 0) {
+			fprintf(stderr, "mprotect RX failed after patching\n");
+		}
+	}
+
 	// CRITICAL: Flush instruction cache on ARM64
 	// This ensures the CPU sees the newly written instructions
 	// Without this, the CPU might execute stale cached instructions
@@ -6872,6 +6980,11 @@ void *hl_jit_code(jit_ctx *ctx, hl_module *m, int *codesize, hl_debug_infos **de
 	// Write debug file if requested via environment variable
 	if (ctx->debug && m->code->hasdebug) {
 		write_jit_debug_file(ctx, m, code, code_size);
+	}
+
+	// Write perf map for profiler support (when not using ELF debug mode)
+	if (ctx->debug && !elf_handle) {
+		write_perf_map(ctx, m, code);
 	}
 
 	// Set return values

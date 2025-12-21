@@ -203,6 +203,7 @@ if (WITH_VM)
         set(JIT_SOURCES
             src/jit_aarch64.c
             src/jit_aarch64_emit.c
+            src/jit_elf.c
             src/jit_shared.c
         )
     else()
@@ -234,6 +235,8 @@ if (WITH_VM)
 
     if (WIN32)
         target_link_libraries(hl user32)
+    else()
+        target_link_libraries(hl dl)  # For dlopen/dlsym in jit_elf.c
     endif()
 endif()
 
