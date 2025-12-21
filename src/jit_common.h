@@ -117,8 +117,8 @@ struct _jit_ctx {
 #ifdef HL_64
 	// Phase 2: Callee-saved register optimization (AArch64 only)
 	unsigned int callee_saved_used;   // Bitmap: bit i = 1 if callee-saved reg i is used
-	int stp_positions[4];             // Positions of 4 STP instructions for backpatching
-	int ldp_positions[4];             // Positions of 4 LDP instructions for backpatching
+	int stp_positions[5];             // Positions of 5 STP instructions for backpatching
+	int ldp_positions[5];             // Positions of 5 LDP instructions for backpatching
 #endif
 };
 

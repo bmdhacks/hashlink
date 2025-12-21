@@ -102,12 +102,18 @@ static const Arm64Reg RCPU_CALLEE_SAVED[] = {
 	X19, X20, X21, X22, X23, X24, X25, X26, X27, X28
 };
 
-// Callee-saved registers available for allocation (excludes RTMP/RTMP2)
+// Callee-saved registers available for allocation
 // These survive function calls, so we don't need to spill them before BLR
-#define RCPU_CALLEE_ALLOC_COUNT 8
+#define RCPU_CALLEE_ALLOC_COUNT 10
 static const Arm64Reg RCPU_CALLEE_ALLOC[] = {
-	X19, X20, X21, X22, X23, X24, X25, X26
+	X19, X20, X21, X22, X23, X24, X25, X26, X27, X28
 };
+
+// Frame size for callee-saved registers + FP/LR
+// Callee-saved: RCPU_CALLEE_SAVED_COUNT * 8 bytes = 80 bytes
+// FP/LR: 16 bytes
+// Total: 96 bytes (must be 16-byte aligned)
+#define CALLEE_SAVED_FRAME_SIZE (RCPU_CALLEE_SAVED_COUNT * 8 + 16)
 
 // FP callee-saved: V8-V15 (only lower 64 bits)
 #define RFPU_CALLEE_SAVED_COUNT 8
@@ -120,9 +126,9 @@ static const Arm64FpReg RFPU_CALLEE_SAVED[] = {
 #define VFPR(i) ((i) + RCPU_COUNT)  // FP register index
 #define PVFPR(i) REG_AT(VFPR(i))    // Pointer to FP register
 
-// Reserved registers for JIT internal use
-#define RTMP  X27  // Temporary register for multi-instruction sequences
-#define RTMP2 X28  // Second temporary register
+// Reserved registers for JIT internal use (caller-saved, no need to preserve)
+#define RTMP  X16  // Temporary register for multi-instruction sequences (IP0)
+#define RTMP2 X17  // Second temporary register (IP1)
 
 // Special purpose registers
 #define RFP X29  // Frame pointer
@@ -4397,9 +4403,9 @@ int hl_jit_function(jit_ctx *ctx, hl_module *m, hl_function *f) {
 			(*arg_count)++;
 		} else {
 			// Argument is on stack (caller's frame)
-			// +80 for saved callee-saved (64 bytes) + FP/LR (16 bytes)
+			// Offset by CALLEE_SAVED_FRAME_SIZE to skip saved registers
 			// Each stack arg occupies 8 bytes (matching caller's prepare_call_args)
-			r->stackPos = argsSize + 80;
+			r->stackPos = argsSize + CALLEE_SAVED_FRAME_SIZE;
 			argsSize += 8;
 		}
 	}
@@ -4426,20 +4432,23 @@ int hl_jit_function(jit_ctx *ctx, hl_module *m, hl_function *f) {
 	memset(ctx->ldp_positions, 0, sizeof(ctx->ldp_positions));
 
 	// Function prologue - offset-based for selective NOP patching (Phase 2)
-	// Reserve space for callee-saved (64 bytes) + FP/LR (16 bytes) = 80 bytes
-	encode_add_sub_imm(ctx, 1, 1, 0, 0, 80, SP_REG, SP_REG);  // SUB SP, SP, #80
+	// Reserve space for callee-saved registers + FP/LR
+	encode_add_sub_imm(ctx, 1, 1, 0, 0, CALLEE_SAVED_FRAME_SIZE, SP_REG, SP_REG);  // SUB SP, SP, #CALLEE_SAVED_FRAME_SIZE
 
 	// Save callee-saved at fixed offsets (NOPpable) - positions recorded for backpatching
 	ctx->stp_positions[0] = BUF_POS();
-	stp_offset(ctx, X25, X26, SP_REG, 64);  // STP X25, X26, [SP, #64]
+	stp_offset(ctx, X27, X28, SP_REG, 80);  // STP X27, X28, [SP, #80]
 
 	ctx->stp_positions[1] = BUF_POS();
-	stp_offset(ctx, X23, X24, SP_REG, 48);  // STP X23, X24, [SP, #48]
+	stp_offset(ctx, X25, X26, SP_REG, 64);  // STP X25, X26, [SP, #64]
 
 	ctx->stp_positions[2] = BUF_POS();
-	stp_offset(ctx, X21, X22, SP_REG, 32);  // STP X21, X22, [SP, #32]
+	stp_offset(ctx, X23, X24, SP_REG, 48);  // STP X23, X24, [SP, #48]
 
 	ctx->stp_positions[3] = BUF_POS();
+	stp_offset(ctx, X21, X22, SP_REG, 32);  // STP X21, X22, [SP, #32]
+
+	ctx->stp_positions[4] = BUF_POS();
 	stp_offset(ctx, X19, X20, SP_REG, 16);  // STP X19, X20, [SP, #16]
 
 	// Save FP/LR at bottom (NOT NOPpable - always needed)
@@ -6506,20 +6515,23 @@ int hl_jit_function(jit_ctx *ctx, hl_module *m, hl_function *f) {
 	ldp_offset(ctx, FP, LR, SP_REG, 0);  // LDP X29, X30, [SP, #0]
 
 	// Restore callee-saved - record positions for potential NOPping
-	ctx->ldp_positions[3] = BUF_POS();
+	ctx->ldp_positions[4] = BUF_POS();
 	ldp_offset(ctx, X19, X20, SP_REG, 16);  // LDP X19, X20, [SP, #16]
 
-	ctx->ldp_positions[2] = BUF_POS();
+	ctx->ldp_positions[3] = BUF_POS();
 	ldp_offset(ctx, X21, X22, SP_REG, 32);  // LDP X21, X22, [SP, #32]
 
-	ctx->ldp_positions[1] = BUF_POS();
+	ctx->ldp_positions[2] = BUF_POS();
 	ldp_offset(ctx, X23, X24, SP_REG, 48);  // LDP X23, X24, [SP, #48]
 
-	ctx->ldp_positions[0] = BUF_POS();
+	ctx->ldp_positions[1] = BUF_POS();
 	ldp_offset(ctx, X25, X26, SP_REG, 64);  // LDP X25, X26, [SP, #64]
 
+	ctx->ldp_positions[0] = BUF_POS();
+	ldp_offset(ctx, X27, X28, SP_REG, 80);  // LDP X27, X28, [SP, #80]
+
 	// Deallocate callee-saved frame
-	encode_add_sub_imm(ctx, 1, 0, 0, 0, 80, SP_REG, SP_REG);  // ADD SP, SP, #80
+	encode_add_sub_imm(ctx, 1, 0, 0, 0, CALLEE_SAVED_FRAME_SIZE, SP_REG, SP_REG);  // ADD SP, SP, #CALLEE_SAVED_FRAME_SIZE
 
 	// RET  ; Return (BR X30)
 	encode_branch_reg(ctx, 0x02, LR);
@@ -6537,12 +6549,12 @@ int hl_jit_function(jit_ctx *ctx, hl_module *m, hl_function *f) {
 	}
 
 	// Phase 2: Backpatch unused callee-saved register saves/restores to NOPs
-	// Each STP/LDP handles a pair: [0]=X25,X26  [1]=X23,X24  [2]=X21,X22  [3]=X19,X20
-	// Bitmap bits: 0,1=X19,X20  2,3=X21,X22  4,5=X23,X24  6,7=X25,X26
+	// Each STP/LDP handles a pair: [0]=X27,X28  [1]=X25,X26  [2]=X23,X24  [3]=X21,X22  [4]=X19,X20
+	// Bitmap bits: 0,1=X19,X20  2,3=X21,X22  4,5=X23,X24  6,7=X25,X26  8,9=X27,X28
 	{
 		int i;
-		for (i = 0; i < 4; i++) {
-			int pair_mask = 3 << ((3-i) * 2);  // stp[0]->bits 6,7, stp[3]->bits 0,1
+		for (i = 0; i < 5; i++) {
+			int pair_mask = 3 << ((4-i) * 2);  // stp[0]->bits 8,9, stp[4]->bits 0,1
 			if (!(ctx->callee_saved_used & pair_mask)) {
 				// Neither register in pair was used - NOP both save and restore
 				unsigned int *stp_code = (unsigned int*)(ctx->startBuf + ctx->stp_positions[i]);
