@@ -65,9 +65,17 @@ static void print_type(hl_type *t) {
         return;
     }
     printf("%s", type_kind_name(t->kind));
-    if (t->kind == HOBJ && t->obj && t->obj->name) {
-        printf("(%ls)", (wchar_t*)t->obj->name);
-    } else if (t->kind == HFUN && t->fun) {
+    if ((t->kind == HOBJ || t->kind == HSTRUCT) && t->obj && t->obj->name) {
+        printf("(%ls", (wchar_t*)t->obj->name);
+        printf(", %d fields", t->obj->nfields);
+        if (t->obj->super) {
+            printf(", super=");
+            print_type(t->obj->super);
+        }
+        printf(")");
+    } else if (t->kind == HVIRTUAL && t->virt) {
+        printf("(%d fields)", t->virt->nfields);
+    } else if ((t->kind == HFUN || t->kind == HMETHOD) && t->fun) {
         printf("(");
         for (int i = 0; i < t->fun->nargs; i++) {
             if (i > 0) printf(",");
@@ -75,6 +83,8 @@ static void print_type(hl_type *t) {
         }
         printf(")->");
         print_type(t->fun->ret);
+    } else if (t->kind == HENUM && t->tenum && t->tenum->name) {
+        printf("(%ls, %d constructs)", (wchar_t*)t->tenum->name, t->tenum->nconstructs);
     }
 }
 

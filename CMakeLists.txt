@@ -568,6 +568,17 @@ if(BUILD_TESTING)
             RUNTIME_OUTPUT_DIRECTORY ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/test/minimal
         )
 
+        # Bytecode validator utility
+        add_executable(hlvalidate
+            ${CMAKE_SOURCE_DIR}/other/tests/minimal/hlvalidate.c
+            ${CMAKE_SOURCE_DIR}/src/code.c
+        )
+        target_link_libraries(hlvalidate libhl)
+        set_target_properties(hlvalidate
+            PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/test/minimal
+        )
+
     endif()
 
     add_test(NAME hello
