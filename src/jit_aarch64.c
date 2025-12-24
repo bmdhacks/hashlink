@@ -4198,39 +4198,53 @@ static void jit_c2hl(jit_ctx *ctx) {
 		EMIT32(ctx,0xFD400000 | (((CALL_NREGS + i) & 0x1FF) << 10) | (X10 << 5) | FP_CALL_REGS[i]);
 	}
 
-	// Push stack args: loop from X11 to X10, pushing each 8-byte value
-	// Calculate how many stack args: (X10 - X11) / 8
-	// Compare X10 and X11
+	// Push stack args from buffer to actual stack
+	// X10 = end of stack args in buffer (= start of reg args area)
+	// X11 = start of stack args in buffer
+	// Stack args size = X10 - X11 (already 16-byte aligned by callback_c2hl)
+
+	// Calculate stack args size: X12 = X10 - X11
+	// SUB X12, X10, X11
+	encode_add_sub_reg(ctx, 1, 1, 0, 0, X11, 0, X10, X12);
+
+	// Skip if no stack args: CBZ X12, done
+	int cbz_pos = BUF_POS();
+	EMIT32(ctx, 0xB4000000 | (X12 & 0x1F));  // CBZ X12, <offset to patch>
+
+	// Allocate stack space: SUB SP, SP, X12
+	encode_add_sub_reg(ctx, 1, 1, 0, 0, X12, 0, SP_REG, SP_REG);
+
+	// Copy args contiguously at 8-byte intervals
+	// X13 = destination pointer (SP), X14 = source pointer (X11)
+	mov_reg_reg(ctx, X13, SP_REG, true);  // MOV X13, SP
+	mov_reg_reg(ctx, X14, X11, true);     // MOV X14, X11 (source = buffer start)
+
+	// Loop: copy 8 bytes at a time until X14 reaches X10
 	int loop_start = BUF_POS();
-	// CMP X10, X11
-	encode_add_sub_reg(ctx, 1, 1, 1, 0, X11, 0, X10, XZR);
+	// CMP X14, X10
+	encode_add_sub_reg(ctx, 1, 1, 1, 0, X10, 0, X14, XZR);
+	// B.GE done (if X14 >= X10, we've copied all args)
+	int bge_pos = BUF_POS();
+	EMIT32(ctx, 0x54000000 | (COND_GE & 0xF));  // B.GE (will patch)
 
-	// B.EQ done (if X10 == X11, no more stack args)
-	int beq_pos = BUF_POS();
-	EMIT32(ctx,0x54000000 | (COND_EQ & 0xF));  // B.EQ (will patch)
+	// LDR X15, [X14], #8 (load and post-increment source)
+	EMIT32(ctx, 0xF8408000 | (8 << 12) | (X14 << 5) | X15);  // LDR X15, [X14], #8
 
-	// SUB X10, X10, #8
-	encode_add_sub_imm(ctx, 1, 1, 0, 0, 8, X10, X10);
-
-	// LDR X12, [X10]
-	encode_ldr_str_imm(ctx, 0x03, 0, 0x01, 0, X10, X12);
-
-	// STR X12, [SP, #-16]! (push with pre-decrement, keeping 16-byte alignment)
-	// We'll push pairs to maintain alignment - but for simplicity, push 16 at a time
-	// SUB SP, SP, #16
-	encode_add_sub_imm(ctx, 1, 1, 0, 0, 16, SP_REG, SP_REG);
-	// STR X12, [SP]
-	encode_ldr_str_imm(ctx, 0x03, 0, 0x00, 0, SP_REG, X12);
+	// STR X15, [X13], #8 (store and post-increment destination)
+	EMIT32(ctx, 0xF8008000 | (8 << 12) | (X13 << 5) | X15);  // STR X15, [X13], #8
 
 	// B loop_start
 	int b_offset = (loop_start - BUF_POS()) / 4;
-	EMIT32(ctx,0x14000000 | (b_offset & 0x3FFFFFF));
+	EMIT32(ctx, 0x14000000 | (b_offset & 0x3FFFFFF));
 
-	// Patch the B.EQ to jump here
+	// Patch the CBZ and B.GE to jump here
 	int done_pos = BUF_POS();
-	int beq_offset = (done_pos - beq_pos) / 4;
-	ctx->buf.w = (unsigned int*)(ctx->startBuf + beq_pos);
-	EMIT32(ctx,0x54000000 | ((beq_offset & 0x7FFFF) << 5) | (COND_EQ & 0xF));
+	int cbz_offset = (done_pos - cbz_pos) / 4;
+	ctx->buf.w = (unsigned int*)(ctx->startBuf + cbz_pos);
+	EMIT32(ctx, 0xB4000000 | ((cbz_offset & 0x7FFFF) << 5) | (X12 & 0x1F));
+	int bge_offset = (done_pos - bge_pos) / 4;
+	ctx->buf.w = (unsigned int*)(ctx->startBuf + bge_pos);
+	EMIT32(ctx, 0x54000000 | ((bge_offset & 0x7FFFF) << 5) | (COND_GE & 0xF));
 	ctx->buf.w = (unsigned int*)(ctx->startBuf + done_pos);
 
 	// Call the function: BLR X9
