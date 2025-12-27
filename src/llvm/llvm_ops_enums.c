@@ -7,7 +7,8 @@
 void llvm_emit_enums(llvm_ctx *ctx, hl_function *f, hl_opcode *op, int op_idx) {
     switch (op->op) {
     case OMakeEnum: {
-        /* dst = make enum with constructor and args */
+        /* dst = make enum with constructor and args
+         * Use pre-computed offsets from c->offsets[i] like the JIT does */
         int dst = op->p1;
         int construct_idx = op->p2;
         int nargs = op->p3;
@@ -30,23 +31,16 @@ void llvm_emit_enums(llvm_ctx *ctx, hl_function *f, hl_opcode *op, int op_idx) {
             LLVMGlobalGetValueType(ctx->rt_alloc_enum),
             ctx->rt_alloc_enum, alloc_args, 2, "");
 
-        /* Set constructor args */
-        /* venum layout: hl_type* t, int index, then args */
-        int args_offset = 16; /* After type ptr (8) and index (4) + padding (4) */
-
+        /* Set constructor args using pre-computed offsets */
         if (enum_type->tenum && construct_idx < enum_type->tenum->nconstructs) {
             hl_enum_construct *c = &enum_type->tenum->constructs[construct_idx];
-            int offset = args_offset;
             for (int i = 0; i < nargs && i < c->nparams; i++) {
-                hl_type *param_type = c->params[i];
+                int offset = c->offsets[i];
                 LLVMValueRef arg = llvm_load_vreg(ctx, f, op->extra[i]);
                 LLVMValueRef off_val = LLVMConstInt(ctx->i64_type, offset, false);
                 LLVMValueRef field_ptr = LLVMBuildGEP2(ctx->builder, ctx->i8_type,
                     enum_obj, &off_val, 1, "");
                 LLVMBuildStore(ctx->builder, arg, field_ptr);
-                offset += llvm_type_size(ctx, param_type);
-                /* Align to 8 bytes */
-                if (offset % 8 != 0) offset += 8 - (offset % 8);
             }
         }
 
@@ -96,7 +90,8 @@ void llvm_emit_enums(llvm_ctx *ctx, hl_function *f, hl_opcode *op, int op_idx) {
     }
 
     case OEnumField: {
-        /* dst = enum.field[field_idx] for constructor construct_idx */
+        /* dst = enum.field[field_idx] for constructor construct_idx
+         * Use pre-computed offsets from c->offsets[field_idx] like the JIT does */
         /* NOTE: extra is used as a direct integer value, not an array pointer */
         int dst = op->p1;
         int src = op->p2;
@@ -108,13 +103,12 @@ void llvm_emit_enums(llvm_ctx *ctx, hl_function *f, hl_opcode *op, int op_idx) {
         LLVMValueRef enum_obj = llvm_load_vreg(ctx, f, src);
         LLVMTypeRef field_llvm_type = llvm_get_type(ctx, dst_type);
 
-        /* Calculate field offset */
-        int offset = 16; /* After type ptr and index */
+        /* Get field offset from constructor's pre-computed offsets array */
+        int offset = 0;
         if (enum_type->tenum && construct_idx < enum_type->tenum->nconstructs) {
             hl_enum_construct *c = &enum_type->tenum->constructs[construct_idx];
-            for (int i = 0; i < field_idx && i < c->nparams; i++) {
-                offset += llvm_type_size(ctx, c->params[i]);
-                if (offset % 8 != 0) offset += 8 - (offset % 8);
+            if (field_idx < c->nparams) {
+                offset = c->offsets[field_idx];
             }
         }
 
@@ -127,7 +121,8 @@ void llvm_emit_enums(llvm_ctx *ctx, hl_function *f, hl_opcode *op, int op_idx) {
     }
 
     case OSetEnumField: {
-        /* enum.field[field_idx] = val */
+        /* enum.field[field_idx] = val
+         * Use pre-computed offsets from c->offsets[field_idx] like the JIT does */
         int enum_reg = op->p1;
         int field_idx = op->p2;
         int src = op->p3;
@@ -136,20 +131,12 @@ void llvm_emit_enums(llvm_ctx *ctx, hl_function *f, hl_opcode *op, int op_idx) {
         LLVMValueRef enum_obj = llvm_load_vreg(ctx, f, enum_reg);
         LLVMValueRef val = llvm_load_vreg(ctx, f, src);
 
-        /* Get constructor index from enum object */
-        LLVMValueRef idx_offset = LLVMConstInt(ctx->i64_type, 8, false);
-        LLVMValueRef idx_ptr = LLVMBuildGEP2(ctx->builder, ctx->i8_type,
-            enum_obj, &idx_offset, 1, "");
-        LLVMValueRef construct_idx = LLVMBuildLoad2(ctx->builder, ctx->i32_type, idx_ptr, "");
-
-        /* For simplicity, calculate offset assuming constructor 0 */
-        /* In practice, we'd need to handle multiple constructors */
-        int offset = 16; /* After type ptr and index */
+        /* Get field offset from constructor 0's pre-computed offsets array */
+        int offset = 0;
         if (enum_type->tenum && enum_type->tenum->nconstructs > 0) {
             hl_enum_construct *c = &enum_type->tenum->constructs[0];
-            for (int i = 0; i < field_idx && i < c->nparams; i++) {
-                offset += llvm_type_size(ctx, c->params[i]);
-                if (offset % 8 != 0) offset += 8 - (offset % 8);
+            if (field_idx < c->nparams) {
+                offset = c->offsets[field_idx];
             }
         }
 

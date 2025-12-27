@@ -85,6 +85,7 @@ typedef struct {
 	int*		strings_lens;
 	char*		bytes;
 	int*		bytes_pos;
+	int		bytes_size;
 	char**		debugfiles;
 	int*		debugfiles_lens;
 	uchar**		ustrings;

@@ -21,6 +21,9 @@
  */
 #include <hl.h>
 #include "hlsystem.h"
+#if defined(__linux__) || defined(__APPLE__) || defined(HL_BSD)
+#include <sys/resource.h>
+#endif
 
 static void fun_var_args() {
 	hl_error("Variable fun args was not cast to typed function");
@@ -392,6 +395,50 @@ HL_PRIM vclosure *hl_make_fun_wrapper( vclosure *v, hl_type *to ) {
 	if( wrap == NULL ) return NULL;
 	if( v->fun != fun_var_args && v->t->fun->nargs != to->fun->nargs )
 		return NULL;
+	// Copy stack-allocated closures to heap to prevent dangling pointers
+	{
+		int on_stack = 0;
+#if defined(HL_WIN)
+		unsigned long ptr = (unsigned long)v;
+		ULONG_PTR low, high;
+		GetCurrentThreadStackLimits(&low, &high);
+		on_stack = (ptr >= low && ptr < high);
+#elif defined(__linux__) || defined(__APPLE__) || defined(HL_BSD)
+		char stack_local;
+		unsigned long sp = (unsigned long)&stack_local;
+		unsigned long ptr = (unsigned long)v;
+		unsigned long diff = (ptr > sp) ? (ptr - sp) : (sp - ptr);
+		static unsigned long cached_stack_size = 0;
+		if( cached_stack_size == 0 ) {
+			struct rlimit rl;
+			cached_stack_size = 8 * 1024 * 1024;
+			if( getrlimit(RLIMIT_STACK, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY )
+				cached_stack_size = rl.rlim_cur;
+		}
+		on_stack = (diff < cached_stack_size);
+#else
+		char stack_local;
+		unsigned long sp = (unsigned long)&stack_local;
+		unsigned long ptr = (unsigned long)v;
+		unsigned long diff = (ptr > sp) ? (ptr - sp) : (sp - ptr);
+		on_stack = (diff < 8 * 1024 * 1024);
+#endif
+		if( on_stack ) {
+			if( v->hasValue == 0 )
+				v = hl_alloc_closure_void(v->t, v->fun);
+			else if( v->hasValue == 1 && v->t->fun->parent != NULL )
+				v = hl_alloc_closure_ptr(v->t->fun->parent, v->fun, v->value);
+			else if( v->hasValue == 2 ) {
+				// v is itself a vclosure_wrapper on stack - copy it to heap
+				vclosure_wrapper *src = (vclosure_wrapper*)v;
+				vclosure_wrapper *dst = (vclosure_wrapper*)hl_gc_alloc(v->t, sizeof(vclosure_wrapper));
+				dst->cl = src->cl;
+				dst->cl.value = dst;  // self-reference
+				dst->wrappedFun = src->wrappedFun;
+				v = (vclosure*)dst;
+			}
+		}
+	}
 	c = (vclosure_wrapper*)hl_gc_alloc(to, sizeof(vclosure_wrapper));
 	c->cl.t = to;
 	c->cl.fun = wrap;

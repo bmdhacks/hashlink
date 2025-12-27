@@ -70,8 +70,13 @@ void llvm_emit_exceptions(llvm_ctx *ctx, hl_function *f, hl_opcode *op, int op_i
         LLVMValueRef setjmp_result = LLVMBuildCall2(ctx->builder, setjmp_fn_type,
             ctx->rt_setjmp, setjmp_args, 1, "setjmp_result");
 
-        /* Mark setjmp call as returns_twice */
-        LLVMSetInstructionCallConv(setjmp_result, LLVMCCallConv);
+        /* Mark setjmp call site as returns_twice - this prevents LLVM from
+         * optimizing away important state that longjmp needs to restore */
+        {
+            unsigned kind = LLVMGetEnumAttributeKindForName("returns_twice", 13);
+            LLVMAttributeRef attr = LLVMCreateEnumAttribute(ctx->context, kind, 0);
+            LLVMAddCallSiteAttribute(setjmp_result, LLVMAttributeFunctionIndex, attr);
+        }
 
         /* Step 6: Branch based on setjmp result */
         /* If setjmp returns 0: continue normally */
@@ -190,32 +195,13 @@ void llvm_emit_exceptions(llvm_ctx *ctx, hl_function *f, hl_opcode *op, int op_i
         break;
     }
 
-    case OCatch: {
+    case OCatch:
         /*
-         * Get caught exception from thread info.
-         * OCatch is used for typing purposes by OTrap - in most cases
-         * the exception is already loaded by OTrap's caught path.
-         * But we implement it properly in case it's used standalone.
+         * OCatch is only used for typing by OTrap - it doesn't execute.
+         * op->p1 is a global index (for type inference), not a register.
+         * The exception value is loaded by OTrap's caught path.
          */
-        int dst = op->p1;
-
-        /* Compute offset using NULL pointer trick */
-        hl_thread_info *tinf = NULL;
-        int offset_exc_value = (int)(int_val)&tinf->exc_value;
-
-        /* Call hl_get_thread() to get thread info */
-        LLVMValueRef thread = LLVMBuildCall2(ctx->builder,
-            LLVMGlobalGetValueType(ctx->rt_get_thread),
-            ctx->rt_get_thread, NULL, 0, "thread");
-
-        /* Load exc_value from thread */
-        LLVMValueRef exc_off_val = LLVMConstInt(ctx->i64_type, offset_exc_value, false);
-        LLVMValueRef exc_ptr = LLVMBuildGEP2(ctx->builder, ctx->i8_type,
-            thread, &exc_off_val, 1, "exc_ptr");
-        LLVMValueRef exc = LLVMBuildLoad2(ctx->builder, ctx->ptr_type, exc_ptr, "exc_value");
-        llvm_store_vreg(ctx, f, dst, exc);
         break;
-    }
 
     default:
         break;

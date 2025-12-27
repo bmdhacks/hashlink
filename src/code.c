@@ -469,12 +469,15 @@ hl_code *hl_code_read( const unsigned char *data, int size, char **error_msg ) {
 	if( c->version >= 5 ) {
 		int size = hl_read_i32(r);
 		c->bytes = hl_malloc(&c->alloc,size);
+		c->bytes_size = size;
 		hl_read_bytes(r,c->bytes,size);
 		ALLOC(c->bytes_pos,int,c->nbytes);
 		CHK_ERROR();
 		for(i=0;i<c->nbytes;i++)
 			c->bytes_pos[i] = UINDEX();
 		CHK_ERROR();
+	} else {
+		c->bytes_size = 0;
 	}
 	if( c->hasdebug ) {
 		c->ndebugfiles = UINDEX();

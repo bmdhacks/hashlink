@@ -4,6 +4,79 @@
  */
 #include "llvm_codegen.h"
 
+/*
+ * Unbox a Null<T> wrapper to get the inner value.
+ * Generates: if (wrapper == null) return default_value; else return wrapper->v;
+ *
+ * This matches the JIT's inline handling in op_safe_cast (jit_aarch64.c:3127-3184).
+ * The Null wrapper layout is: { hl_type *t; T v; } where v is at offset 8.
+ *
+ * Supports primitive types: HUI8, HUI16, HI32, HBOOL, HI64, HGUID, HF32, HF64
+ * Returns NULL for unsupported types (caller should fall back to runtime).
+ */
+LLVMValueRef llvm_unbox_null(llvm_ctx *ctx, LLVMValueRef wrapper_ptr, hl_type *inner_type) {
+    /* Only handle primitive types inline */
+    switch (inner_type->kind) {
+    case HUI8:
+    case HUI16:
+    case HI32:
+    case HBOOL:
+    case HI64:
+    case HGUID:
+    case HF32:
+    case HF64:
+        break;
+    default:
+        return NULL;  /* Caller should use runtime */
+    }
+
+    LLVMTypeRef val_type = llvm_get_type(ctx, inner_type);
+
+    /* Check if null */
+    LLVMValueRef is_null = LLVMBuildICmp(ctx->builder, LLVMIntEQ, wrapper_ptr,
+        LLVMConstNull(ctx->ptr_type), "is_null");
+
+    /* Create basic blocks */
+    LLVMBasicBlockRef not_null_bb = LLVMAppendBasicBlock(ctx->current_function, "unbox_not_null");
+    LLVMBasicBlockRef null_bb = LLVMAppendBasicBlock(ctx->current_function, "unbox_null");
+    LLVMBasicBlockRef merge_bb = LLVMAppendBasicBlock(ctx->current_function, "unbox_merge");
+
+    LLVMBuildCondBr(ctx->builder, is_null, null_bb, not_null_bb);
+
+    /* Not null path: load value from offset 8 (the 'v' field after type pointer) */
+    LLVMPositionBuilderAtEnd(ctx->builder, not_null_bb);
+    LLVMValueRef offset_8 = LLVMConstInt(ctx->i64_type, 8, false);
+    LLVMValueRef val_ptr = LLVMBuildGEP2(ctx->builder, ctx->i8_type,
+        wrapper_ptr, &offset_8, 1, "val_ptr");
+    LLVMValueRef loaded_val = LLVMBuildLoad2(ctx->builder, val_type, val_ptr, "loaded_val");
+    LLVMBuildBr(ctx->builder, merge_bb);
+    LLVMBasicBlockRef not_null_end = LLVMGetInsertBlock(ctx->builder);
+
+    /* Null path: use default value (0 or null pointer) */
+    LLVMPositionBuilderAtEnd(ctx->builder, null_bb);
+    LLVMValueRef default_val;
+    if (inner_type->kind == HF32) {
+        default_val = LLVMConstReal(ctx->f32_type, 0.0);
+    } else if (inner_type->kind == HF64) {
+        default_val = LLVMConstReal(ctx->f64_type, 0.0);
+    } else if (LLVMGetTypeKind(val_type) == LLVMPointerTypeKind) {
+        default_val = LLVMConstNull(val_type);
+    } else {
+        default_val = LLVMConstInt(val_type, 0, false);
+    }
+    LLVMBuildBr(ctx->builder, merge_bb);
+    LLVMBasicBlockRef null_end = LLVMGetInsertBlock(ctx->builder);
+
+    /* Merge with phi */
+    LLVMPositionBuilderAtEnd(ctx->builder, merge_bb);
+    LLVMValueRef phi = LLVMBuildPhi(ctx->builder, val_type, "unboxed");
+    LLVMValueRef incoming_vals[] = { loaded_val, default_val };
+    LLVMBasicBlockRef incoming_bbs[] = { not_null_end, null_end };
+    LLVMAddIncoming(phi, incoming_vals, incoming_bbs, 2);
+
+    return phi;
+}
+
 void llvm_emit_types(llvm_ctx *ctx, hl_function *f, hl_opcode *op, int op_idx) {
     switch (op->op) {
     case OType: {
@@ -16,13 +89,45 @@ void llvm_emit_types(llvm_ctx *ctx, hl_function *f, hl_opcode *op, int op_idx) {
     }
 
     case OGetType: {
-        /* dst = obj->t (type of object) */
+        /*
+         * dst = obj->t (type of object)
+         * If obj is NULL, return &hlt_void (matches JIT behavior)
+         */
         int dst = op->p1;
         int src = op->p2;
         LLVMValueRef obj = llvm_load_vreg(ctx, f, src);
-        /* First field of any object is hl_type* t */
-        LLVMValueRef type_ptr = LLVMBuildLoad2(ctx->builder, ctx->ptr_type, obj, "");
-        llvm_store_vreg(ctx, f, dst, type_ptr);
+
+        /* Check if object is null */
+        LLVMValueRef is_null = LLVMBuildICmp(ctx->builder, LLVMIntEQ, obj,
+            LLVMConstNull(ctx->ptr_type), "is_null");
+
+        /* Create basic blocks */
+        LLVMBasicBlockRef not_null_bb = LLVMAppendBasicBlock(ctx->current_function, "gettype_not_null");
+        LLVMBasicBlockRef null_bb = LLVMAppendBasicBlock(ctx->current_function, "gettype_null");
+        LLVMBasicBlockRef merge_bb = LLVMAppendBasicBlock(ctx->current_function, "gettype_merge");
+
+        LLVMBuildCondBr(ctx->builder, is_null, null_bb, not_null_bb);
+
+        /* Not null path: load type from object (first field at offset 0) */
+        LLVMPositionBuilderAtEnd(ctx->builder, not_null_bb);
+        LLVMValueRef type_from_obj = LLVMBuildLoad2(ctx->builder, ctx->ptr_type, obj, "obj_type");
+        LLVMBuildBr(ctx->builder, merge_bb);
+        LLVMBasicBlockRef not_null_end = LLVMGetInsertBlock(ctx->builder);
+
+        /* Null path: return &hlt_void */
+        LLVMPositionBuilderAtEnd(ctx->builder, null_bb);
+        LLVMValueRef void_type = ctx->rt_hlt_void;
+        LLVMBuildBr(ctx->builder, merge_bb);
+        LLVMBasicBlockRef null_end = LLVMGetInsertBlock(ctx->builder);
+
+        /* Merge with phi */
+        LLVMPositionBuilderAtEnd(ctx->builder, merge_bb);
+        LLVMValueRef phi = LLVMBuildPhi(ctx->builder, ctx->ptr_type, "type_ptr");
+        LLVMValueRef incoming_vals[] = { type_from_obj, void_type };
+        LLVMBasicBlockRef incoming_bbs[] = { not_null_end, null_end };
+        LLVMAddIncoming(phi, incoming_vals, incoming_bbs, 2);
+
+        llvm_store_vreg(ctx, f, dst, phi);
         break;
     }
 
@@ -56,10 +161,19 @@ void llvm_emit_types(llvm_ctx *ctx, hl_function *f, hl_opcode *op, int op_idx) {
                 llvm_get_type(ctx, src_type), "todyn_tmp");
             LLVMBuildStore(ctx->builder, val, val_alloca);
 
-            /* Get type pointer for the source type */
+            /* Get type pointer for the source type.
+             * Search for a type in the types array with matching kind.
+             * We need to find a type whose kind matches src_type->kind, not just
+             * any type that src_type happens to point to, because the register
+             * type might be a global singleton that's not in the types array,
+             * or might be aliased incorrectly.
+             *
+             * Basic types (HUI8, HUI16, HI32, HI64, HF32, HF64, HBOOL, HGUID) may be
+             * global singletons rather than entries in the types array. */
             int type_idx = -1;
+            hl_type_kind k = src_type->kind;
             for (int i = 0; i < ctx->code->ntypes; i++) {
-                if (ctx->code->types + i == src_type) {
+                if (ctx->code->types[i].kind == k) {
                     type_idx = i;
                     break;
                 }
@@ -95,8 +209,11 @@ void llvm_emit_types(llvm_ctx *ctx, hl_function *f, hl_opcode *op, int op_idx) {
             } else {
                 result = val; /* Same type */
             }
+        } else if (src_type->kind == HUI8 || src_type->kind == HUI16) {
+            /* Unsigned integer to float - use uitofp */
+            result = LLVMBuildUIToFP(ctx->builder, val, target_type, "");
         } else {
-            /* Integer to float - use sitofp */
+            /* Signed integer to float - use sitofp */
             result = LLVMBuildSIToFP(ctx->builder, val, target_type, "");
         }
         llvm_store_vreg(ctx, f, dst, result);
@@ -131,25 +248,44 @@ void llvm_emit_types(llvm_ctx *ctx, hl_function *f, hl_opcode *op, int op_idx) {
     }
 
     case OToInt: {
-        /* dst = (int)src */
+        /* dst = (int)src - convert to integer type */
         int dst = op->p1;
         int src = op->p2;
         hl_type *src_type = f->regs[src];
         hl_type *dst_type = f->regs[dst];
-        LLVMTypeRef target_type = llvm_get_type(ctx, dst_type);
         LLVMValueRef val = llvm_load_vreg(ctx, f, src);
 
+        /* Determine target integer type based on destination kind */
+        LLVMTypeRef target_type;
+        switch (dst_type->kind) {
+        case HI64:
+        case HGUID:  /* HGUID is also 64-bit */
+            target_type = ctx->i64_type; break;
+        case HUI8: case HBOOL: target_type = ctx->i8_type; break;
+        case HUI16: target_type = ctx->i16_type; break;
+        default: target_type = ctx->i32_type; break;  /* HI32 and others */
+        }
+
         LLVMValueRef result;
+        LLVMTypeRef val_type = LLVMTypeOf(val);
         if (llvm_is_float_type(src_type)) {
             result = LLVMBuildFPToSI(ctx->builder, val, target_type, "");
+        } else if (LLVMGetTypeKind(val_type) == LLVMPointerTypeKind) {
+            /* Pointer to integer - use ptrtoint */
+            result = LLVMBuildPtrToInt(ctx->builder, val, target_type, "");
         } else {
             /* Integer to integer - handle width differences */
-            unsigned src_bits = LLVMGetIntTypeWidth(LLVMTypeOf(val));
+            unsigned src_bits = LLVMGetIntTypeWidth(val_type);
             unsigned dst_bits = LLVMGetIntTypeWidth(target_type);
             if (src_bits > dst_bits) {
                 result = LLVMBuildTrunc(ctx->builder, val, target_type, "");
             } else if (src_bits < dst_bits) {
-                result = LLVMBuildSExt(ctx->builder, val, target_type, "");
+                /* Use zero-extension for unsigned types, sign-extension for signed */
+                if (src_type->kind == HUI8 || src_type->kind == HUI16) {
+                    result = LLVMBuildZExt(ctx->builder, val, target_type, "");
+                } else {
+                    result = LLVMBuildSExt(ctx->builder, val, target_type, "");
+                }
             } else {
                 result = val;
             }
@@ -200,6 +336,24 @@ void llvm_emit_types(llvm_ctx *ctx, hl_function *f, hl_opcode *op, int op_idx) {
         LLVMValueRef src_addr = ctx->vreg_allocs[src];
 
         LLVMValueRef result;
+
+        /*
+         * Special case: Null<T> -> T unboxing
+         * The JIT handles this inline instead of calling runtime functions.
+         * Use the llvm_unbox_null helper which handles primitive types.
+         */
+        if (src_type->kind == HNULL && src_type->tparam &&
+            src_type->tparam->kind == dst_type->kind) {
+            LLVMValueRef wrapper_ptr = llvm_load_vreg(ctx, f, src);
+            LLVMValueRef unboxed = llvm_unbox_null(ctx, wrapper_ptr, dst_type);
+            if (unboxed) {
+                llvm_store_vreg(ctx, f, dst, unboxed);
+                break;
+            }
+            /* Fall through to runtime for unsupported types */
+        }
+
+        /* Runtime cast path - use appropriate hl_dyn_cast* function */
         switch (dst_type->kind) {
         case HF32: {
             /* hl_dyn_castf(ptr, src_type) -> float */
@@ -217,8 +371,10 @@ void llvm_emit_types(llvm_ctx *ctx, hl_function *f, hl_opcode *op, int op_idx) {
                 ctx->rt_dyn_castd, args, 2, "");
             break;
         }
-        case HI64: {
+        case HI64:
+        case HGUID: {
             /* hl_dyn_casti64(ptr, src_type) -> i64 */
+            /* HGUID is 64-bit like HI64, uses same cast function */
             LLVMValueRef args[] = { src_addr, src_type_ptr };
             result = LLVMBuildCall2(ctx->builder,
                 LLVMGlobalGetValueType(ctx->rt_dyn_casti64),

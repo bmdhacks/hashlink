@@ -35,8 +35,15 @@
  *   -O1            Light optimization
  *   -O2            Default optimization [default]
  *   -O3            Aggressive optimization
+ *   --inline-threshold=N  Set inliner threshold (default: use LLVM's, try 5000 for aggressive)
+ *   --fast-math[=MODE]    Enable fast-math (MODE: safe or full, default=safe)
+ *   --mcpu=X       Override target CPU (default: auto-detect)
+ *   --mattr=X      Override/set target features (e.g., "+v8.4a,+crypto")
  *   -g             Emit debug info
  *   -v             Verbose output
+ *   --rss          Report memory usage (RSS) per batch
+ *   --batch        Batched compilation (~200 functions/batch)
+ *   --batch-size=N Custom batch size
  *   --help         Show this help
  */
 
@@ -44,7 +51,27 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
+#include <sys/stat.h>
+#include <libgen.h>
+#include <errno.h>
 #include "llvm_codegen.h"
+
+/* Get current RSS in KB from /proc/self/status */
+static long get_rss_kb(void) {
+    FILE *f = fopen("/proc/self/status", "r");
+    if (!f) return -1;
+
+    char line[256];
+    long rss = -1;
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, "VmRSS:", 6) == 0) {
+            sscanf(line + 6, "%ld", &rss);
+            break;
+        }
+    }
+    fclose(f);
+    return rss;
+}
 
 static void print_usage(const char *prog) {
     printf("HashLink bytecode to LLVM IR AOT compiler\n\n");
@@ -59,8 +86,15 @@ static void print_usage(const char *prog) {
     printf("  -O1            Light optimization\n");
     printf("  -O2            Default optimization [default]\n");
     printf("  -O3            Aggressive optimization\n");
+    printf("  --inline-threshold=N  Set inliner threshold (try 5000 for aggressive)\n");
+    printf("  --fast-math[=MODE]    Fast-math: 'safe' (default) or 'full' (breaks NaN/Inf)\n");
+    printf("  --mcpu=X       Override target CPU (default: auto-detect, use -v to see)\n");
+    printf("  --mattr=X      Set target features (e.g., \"+v8.4a,+crypto,+fullfp16\")\n");
     printf("  -g             Emit debug info\n");
-    printf("  -v             Verbose output\n");
+    printf("  -v             Verbose output (shows detected CPU/features)\n");
+    printf("  --rss          Report memory usage (RSS) per batch\n");
+    printf("  --batch        Batched compilation (~200 functions/batch)\n");
+    printf("  --batch-size=N Custom batch size (minimum 10)\n");
     printf("  --help         Show this help\n");
 }
 
@@ -71,6 +105,12 @@ int main(int argc, char **argv) {
     llvm_opt_level opt_level = LLVM_OPT_DEFAULT;
     bool emit_debug = false;
     bool verbose = false;
+    bool report_rss = false;
+    int batch_size = 0;  /* 0 = single file, >0 = batched mode */
+    int inline_threshold = 0;  /* 0 = use LLVM default */
+    int fast_math = 0;         /* 0=off, 1=safe, 2=full */
+    const char *target_cpu = NULL;
+    const char *target_features = NULL;
 
     /* Parse command line arguments */
     for (int i = 1; i < argc; i++) {
@@ -103,6 +143,25 @@ int main(int argc, char **argv) {
             emit_debug = true;
         } else if (strcmp(argv[i], "-v") == 0) {
             verbose = true;
+        } else if (strcmp(argv[i], "--rss") == 0) {
+            report_rss = true;
+        } else if (strcmp(argv[i], "--batch") == 0) {
+            batch_size = 200;  /* Default batch size */
+        } else if (strncmp(argv[i], "--batch-size=", 13) == 0) {
+            batch_size = atoi(argv[i] + 13);
+            if (batch_size < 10) batch_size = 10;  /* Minimum batch size */
+        } else if (strncmp(argv[i], "--inline-threshold=", 19) == 0) {
+            inline_threshold = atoi(argv[i] + 19);
+            if (inline_threshold < 0) inline_threshold = 0;
+        } else if (strcmp(argv[i], "--fast-math") == 0 ||
+                   strcmp(argv[i], "--fast-math=safe") == 0) {
+            fast_math = 1;  /* safe mode */
+        } else if (strcmp(argv[i], "--fast-math=full") == 0) {
+            fast_math = 2;  /* full mode (breaks NaN/Inf) */
+        } else if (strncmp(argv[i], "--mcpu=", 7) == 0) {
+            target_cpu = argv[i] + 7;
+        } else if (strncmp(argv[i], "--mattr=", 8) == 0) {
+            target_features = argv[i] + 8;
         } else if (argv[i][0] == '-') {
             fprintf(stderr, "Unknown option: %s\n", argv[i]);
             return 1;
@@ -173,6 +232,25 @@ int main(int argc, char **argv) {
     if (verbose) {
         printf("Loaded bytecode: %d functions, %d types, %d globals\n",
                code->nfunctions, code->ntypes, code->nglobals);
+
+        /* Show target CPU/features info */
+        char *detected_cpu = LLVMGetHostCPUName();
+        char *detected_features = LLVMGetHostCPUFeatures();
+        char *triple = LLVMGetDefaultTargetTriple();
+        printf("Target triple: %s\n", triple);
+        printf("Detected CPU: %s%s\n", detected_cpu,
+               target_cpu ? " (overridden)" : "");
+        if (target_cpu) {
+            printf("Using CPU: %s\n", target_cpu);
+        }
+        printf("Detected features: %s%s\n", detected_features,
+               target_features ? " (overridden)" : "");
+        if (target_features) {
+            printf("Using features: %s\n", target_features);
+        }
+        LLVMDisposeMessage(detected_cpu);
+        LLVMDisposeMessage(detected_features);
+        LLVMDisposeMessage(triple);
     }
 
     /* Create minimal module context - needed for hl_get_obj_rt() during compilation.
@@ -203,6 +281,208 @@ int main(int argc, char **argv) {
         }
     }
 
+    /* Initialize enum types so construct offsets are computed */
+    for (int i = 0; i < code->ntypes; i++) {
+        hl_type *t = &code->types[i];
+        if (t->kind == HENUM && t->tenum) {
+            hl_init_enum(t, &module_ctx);
+        }
+    }
+
+    /* Batch compilation mode */
+    if (batch_size > 0) {
+        int num_batches = (code->nfunctions + batch_size - 1) / batch_size;
+
+        /* Create output directory: foo.o.d/ */
+        char output_dir[4096];
+        snprintf(output_dir, sizeof(output_dir), "%s.d", output_file);
+        if (mkdir(output_dir, 0755) != 0 && errno != EEXIST) {
+            fprintf(stderr, "Error: Cannot create output directory %s\n", output_dir);
+            hl_free(&module_ctx.alloc);
+            free(module_ctx.functions_types);
+            free(fdata);
+            hl_code_free(code);
+            return 1;
+        }
+
+        /* Create manifest file */
+        char manifest_path[4096];
+        snprintf(manifest_path, sizeof(manifest_path), "%s/manifest.txt", output_dir);
+        FILE *manifest = fopen(manifest_path, "w");
+        if (!manifest) {
+            fprintf(stderr, "Error: Cannot create manifest file %s\n", manifest_path);
+            hl_free(&module_ctx.alloc);
+            free(module_ctx.functions_types);
+            free(fdata);
+            hl_code_free(code);
+            return 1;
+        }
+        fprintf(manifest, "# hl2llvm batch compilation manifest\n");
+        fprintf(manifest, "# Link with: clang @%s -lhl -o output\n", manifest_path);
+
+        if (verbose) {
+            printf("Batch compilation: %d functions, %d batches of %d\n",
+                   code->nfunctions, num_batches, batch_size);
+        }
+
+        /* Compile each batch + final */
+        for (int batch = 0; batch <= num_batches; batch++) {
+            llvm_ctx *ctx = llvm_create_context();
+            if (!ctx) {
+                fprintf(stderr, "Error: Failed to create LLVM context for batch %d\n", batch);
+                fclose(manifest);
+                hl_free(&module_ctx.alloc);
+                free(module_ctx.functions_types);
+                free(fdata);
+                hl_code_free(code);
+                return 1;
+            }
+
+            ctx->opt_level = opt_level;
+            ctx->emit_debug_info = emit_debug;
+            ctx->inline_threshold = inline_threshold;
+            ctx->fast_math = fast_math;
+            ctx->target_cpu = target_cpu;
+            ctx->target_features = target_features;
+            ctx->bytecode_data = (unsigned char *)fdata;
+            ctx->bytecode_size = size;
+
+            if (batch < num_batches) {
+                /* Function batch */
+                ctx->batch_mode = (batch == 0) ? LLVM_BATCH_FIRST : LLVM_BATCH_SUBSEQUENT;
+                ctx->batch_start = batch * batch_size;
+                ctx->batch_end = (batch + 1) * batch_size;
+                if (ctx->batch_end > code->nfunctions)
+                    ctx->batch_end = code->nfunctions;
+            } else {
+                /* Final batch: entry point only */
+                ctx->batch_mode = LLVM_BATCH_FINAL;
+                ctx->batch_start = 0;
+                ctx->batch_end = 0;
+            }
+
+            char batch_name[64];
+            snprintf(batch_name, sizeof(batch_name), "batch_%d", batch);
+
+            if (verbose) {
+                if (ctx->batch_mode == LLVM_BATCH_FINAL) {
+                    printf("  Batch %d/%d: entry point (final)\n", batch + 1, num_batches + 1);
+                } else {
+                    printf("  Batch %d/%d: functions %d-%d\n", batch + 1, num_batches + 1,
+                           ctx->batch_start, ctx->batch_end - 1);
+                }
+            }
+
+            if (!llvm_init_module(ctx, code, batch_name)) {
+                fprintf(stderr, "Error: Failed to init module for batch %d: %s\n",
+                        batch, ctx->error_msg ? ctx->error_msg : "unknown error");
+                llvm_destroy_context(ctx);
+                fclose(manifest);
+                hl_free(&module_ctx.alloc);
+                free(module_ctx.functions_types);
+                free(fdata);
+                hl_code_free(code);
+                return 1;
+            }
+
+            if (ctx->batch_mode != LLVM_BATCH_FINAL) {
+                /* Compile functions in this batch */
+                for (int i = ctx->batch_start; i < ctx->batch_end; i++) {
+                    if (!llvm_compile_function(ctx, &code->functions[i])) {
+                        fprintf(stderr, "Error: Failed to compile function %d: %s\n",
+                                i, ctx->error_msg ? ctx->error_msg : "unknown error");
+                        llvm_destroy_context(ctx);
+                        fclose(manifest);
+                        hl_free(&module_ctx.alloc);
+                        free(module_ctx.functions_types);
+                        free(fdata);
+                        hl_code_free(code);
+                        return 1;
+                    }
+                }
+            } else {
+                /* Generate entry point */
+                if (!llvm_generate_entry_point(ctx, code->entrypoint)) {
+                    fprintf(stderr, "Error: Failed to generate entry point: %s\n",
+                            ctx->error_msg ? ctx->error_msg : "unknown error");
+                    llvm_destroy_context(ctx);
+                    fclose(manifest);
+                    hl_free(&module_ctx.alloc);
+                    free(module_ctx.functions_types);
+                    free(fdata);
+                    hl_code_free(code);
+                    return 1;
+                }
+            }
+
+            llvm_finalize_module(ctx);
+
+            if (!llvm_verify(ctx)) {
+                fprintf(stderr, "Error: Batch %d verification failed: %s\n",
+                        batch, ctx->error_msg ? ctx->error_msg : "unknown error");
+                llvm_destroy_context(ctx);
+                fclose(manifest);
+                hl_free(&module_ctx.alloc);
+                free(module_ctx.functions_types);
+                free(fdata);
+                hl_code_free(code);
+                return 1;
+            }
+
+            if (opt_level > LLVM_OPT_NONE) {
+                llvm_optimize(ctx);
+            }
+
+            /* Output batch .o file */
+            char batch_file[4096];
+            if (ctx->batch_mode == LLVM_BATCH_FINAL) {
+                snprintf(batch_file, sizeof(batch_file), "%s/final.o", output_dir);
+            } else {
+                snprintf(batch_file, sizeof(batch_file), "%s/batch.%d.o", output_dir, batch + 1);
+            }
+
+            if (!llvm_output(ctx, batch_file, format)) {
+                fprintf(stderr, "Error: Failed to write batch %d: %s\n",
+                        batch, ctx->error_msg ? ctx->error_msg : "unknown error");
+                llvm_destroy_context(ctx);
+                fclose(manifest);
+                hl_free(&module_ctx.alloc);
+                free(module_ctx.functions_types);
+                free(fdata);
+                hl_code_free(code);
+                return 1;
+            }
+
+            fprintf(manifest, "%s\n", batch_file);
+
+            if (report_rss) {
+                long rss = get_rss_kb();
+                if (rss > 0) {
+                    printf("  Batch %d RSS: %ld MB\n", batch + 1, rss / 1024);
+                }
+            }
+
+            /* Free LLVM memory for next batch */
+            llvm_destroy_context(ctx);
+        }
+
+        fclose(manifest);
+
+        if (verbose) {
+            printf("Batch compilation complete: %d batches + final\n", num_batches);
+            printf("Link with: clang @%s -lhl -o output\n", manifest_path);
+        }
+
+        /* Cleanup and exit */
+        hl_free(&module_ctx.alloc);
+        free(module_ctx.functions_types);
+        free(fdata);
+        hl_code_free(code);
+        return 0;
+    }
+
+    /* Single-file compilation mode (original behavior) */
+
     /* Create LLVM context */
     llvm_ctx *ctx = llvm_create_context();
     if (ctx == NULL) {
@@ -213,6 +493,10 @@ int main(int argc, char **argv) {
 
     ctx->opt_level = opt_level;
     ctx->emit_debug_info = emit_debug;
+    ctx->inline_threshold = inline_threshold;
+    ctx->fast_math = fast_math;
+    ctx->target_cpu = target_cpu;
+    ctx->target_features = target_features;
     ctx->bytecode_data = (unsigned char *)fdata;
     ctx->bytecode_size = size;
 
@@ -310,6 +594,13 @@ int main(int argc, char **argv) {
         llvm_destroy_context(ctx);
         hl_code_free(code);
         return 1;
+    }
+
+    if (report_rss) {
+        long rss = get_rss_kb();
+        if (rss > 0) {
+            printf("RSS: %ld MB\n", rss / 1024);
+        }
     }
 
     if (verbose) {

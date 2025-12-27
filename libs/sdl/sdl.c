@@ -103,6 +103,7 @@ static bool isGlOptionsSet = false;
 
 HL_PRIM bool HL_NAME(init_once)() {
 	SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
+	SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");
 	if( SDL_Init(SDL_INIT_EVERYTHING) != 0 ) {
 		hl_error("SDL_Init failed: %s", hl_to_utf16(SDL_GetError()));
 		return false;

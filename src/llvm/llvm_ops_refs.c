@@ -51,9 +51,9 @@ void llvm_emit_refs(llvm_ctx *ctx, hl_function *f, hl_opcode *op, int op_idx) {
         LLVMValueRef obj = llvm_load_vreg(ctx, f, src);
 
         /* For bytes, data is the pointer itself */
-        /* For arrays, data starts at offset 16 (after type and size) */
+        /* For arrays, data starts after sizeof(varray) header */
         if (src_type->kind == HARRAY) {
-            LLVMValueRef data_offset = LLVMConstInt(ctx->i64_type, 16, false);
+            LLVMValueRef data_offset = LLVMConstInt(ctx->i64_type, sizeof(varray), false);
             LLVMValueRef data_ptr = LLVMBuildGEP2(ctx->builder, ctx->i8_type,
                 obj, &data_offset, 1, "");
             llvm_store_vreg(ctx, f, dst, data_ptr);

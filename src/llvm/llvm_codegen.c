@@ -22,6 +22,8 @@
 #include "llvm_codegen.h"
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
 
 /* Forward declarations */
 static void compile_opcode(llvm_ctx *ctx, hl_function *f, hl_opcode *op, int op_idx);
@@ -111,8 +113,12 @@ bool llvm_init_module(llvm_ctx *ctx, hl_code *code, const char *module_name) {
     }
 
     /* Get native CPU and features for best performance */
-    char *cpu = LLVMGetHostCPUName();
-    char *features = LLVMGetHostCPUFeatures();
+    char *detected_cpu = LLVMGetHostCPUName();
+    char *detected_features = LLVMGetHostCPUFeatures();
+
+    /* Use overrides if provided, else use detected values */
+    const char *cpu = ctx->target_cpu ? ctx->target_cpu : detected_cpu;
+    const char *features = ctx->target_features ? ctx->target_features : detected_features;
 
     ctx->target_machine = LLVMCreateTargetMachine(
         target, triple, cpu, features,
@@ -121,8 +127,8 @@ bool llvm_init_module(llvm_ctx *ctx, hl_code *code, const char *module_name) {
         LLVMCodeModelDefault
     );
 
-    LLVMDisposeMessage(cpu);
-    LLVMDisposeMessage(features);
+    LLVMDisposeMessage(detected_cpu);
+    LLVMDisposeMessage(detected_features);
     LLVMDisposeMessage(triple);
 
     if (!ctx->target_machine) {
@@ -176,12 +182,17 @@ bool llvm_init_module(llvm_ctx *ctx, hl_code *code, const char *module_name) {
         /* Map native function names to actual symbols:
          * - "std" library functions use "hl_" prefix (built into libhl.so)
          * - Other libraries use their lib name as prefix (in hdll files)
+         * - "?" prefix indicates optional native - strip it and use weak linkage
          */
+        const char *lib = n->lib;
+        bool is_optional = (lib[0] == '?');
+        if (is_optional) lib++;
+
         char name[256];
-        if (strcmp(n->lib, "std") == 0) {
+        if (strcmp(lib, "std") == 0) {
             snprintf(name, sizeof(name), "hl_%s", n->name);
         } else {
-            snprintf(name, sizeof(name), "%s_%s", n->lib, n->name);
+            snprintf(name, sizeof(name), "%s_%s", lib, n->name);
         }
         /* Check if function already declared by runtime declarations.
          * If so, use existing to avoid LLVM creating suffixed symbols.
@@ -194,55 +205,112 @@ bool llvm_init_module(llvm_ctx *ctx, hl_code *code, const char *module_name) {
             LLVMTypeRef fn_type = llvm_get_function_type(ctx, n->t);
             ctx->function_types[n->findex] = fn_type;
             ctx->functions[n->findex] = LLVMAddFunction(ctx->module, name, fn_type);
-            LLVMSetLinkage(ctx->functions[n->findex], LLVMExternalLinkage);
+            /* Optional natives use weak linkage so linking succeeds even if symbol is missing.
+             * At runtime, calls to missing optional natives will crash (same as JIT behavior
+             * when disabled_primitive is called). */
+            if (is_optional) {
+                LLVMSetLinkage(ctx->functions[n->findex], LLVMExternalWeakLinkage);
+            } else {
+                LLVMSetLinkage(ctx->functions[n->findex], LLVMExternalLinkage);
+            }
         }
     }
 
-    /* Create global variables storage */
+    /* Create global variables storage.
+     * In batch mode: first batch defines, subsequent batches declare as external. */
     LLVMTypeRef globals_type = LLVMArrayType(ctx->i8_type, code->nglobals * 8);
-    ctx->globals_base = LLVMAddGlobal(ctx->module, globals_type, "hl_globals");
-    LLVMSetInitializer(ctx->globals_base, LLVMConstNull(globals_type));
+    if (ctx->batch_mode == LLVM_BATCH_NONE || ctx->batch_mode == LLVM_BATCH_FIRST) {
+        /* Define with initializer */
+        ctx->globals_base = LLVMAddGlobal(ctx->module, globals_type, "hl_globals");
+        LLVMSetInitializer(ctx->globals_base, LLVMConstNull(globals_type));
+    } else if (ctx->batch_mode == LLVM_BATCH_SUBSEQUENT) {
+        /* Declare as external reference */
+        ctx->globals_base = LLVMAddGlobal(ctx->module, globals_type, "hl_globals");
+        LLVMSetLinkage(ctx->globals_base, LLVMExternalLinkage);
+        /* No initializer - external reference */
+    }
+    /* LLVM_BATCH_FINAL doesn't need globals (entry point references functions only) */
 
     /* Create pointers to individual globals (each global is at offset i*8 in the array) */
-    for (int i = 0; i < code->nglobals; i++) {
-        LLVMValueRef indices[] = {
-            LLVMConstInt(ctx->i64_type, 0, false),
-            LLVMConstInt(ctx->i64_type, i * 8, false)
-        };
-        ctx->global_refs[i] = LLVMConstGEP2(globals_type, ctx->globals_base, indices, 2);
+    if (ctx->batch_mode != LLVM_BATCH_FINAL) {
+        for (int i = 0; i < code->nglobals; i++) {
+            LLVMValueRef indices[] = {
+                LLVMConstInt(ctx->i64_type, 0, false),
+                LLVMConstInt(ctx->i64_type, i * 8, false)
+            };
+            ctx->global_refs[i] = LLVMConstGEP2(globals_type, ctx->globals_base, indices, 2);
+        }
     }
 
-    /* Create string constants */
-    for (int i = 0; i < code->nstrings; i++) {
-        const char *str = code->strings[i];
-        int len = code->strings_lens[i];
-        char name[32];
-        snprintf(name, sizeof(name), ".str.%d", i);
+    /* Create string constants.
+     * Bytecode stores strings as UTF-8 (code->strings[]).
+     * HashLink runtime uses UTF-16 (uchar*).
+     * Must convert via hl_get_ustring() before embedding as constants.
+     * In batch mode: first batch defines with external linkage, others declare as external. */
+    if (ctx->batch_mode == LLVM_BATCH_NONE || ctx->batch_mode == LLVM_BATCH_FIRST) {
+        for (int i = 0; i < code->nstrings; i++) {
+            const uchar *ustr = hl_get_ustring(code, i);
+            /* Calculate UTF-16 string length (code units) by finding null terminator */
+            int ulen = 0;
+            while (ustr[ulen]) ulen++;
+            /* Length in bytes = code units * 2 (including null terminator) */
+            int byte_len = (ulen + 1) * sizeof(uchar);
+            char name[32];
+            snprintf(name, sizeof(name), "hl_str_%d", i);  /* No dot prefix for linking */
 
-        /* Create global string constant */
-        LLVMValueRef str_val = LLVMConstStringInContext(ctx->context, str, len, 1);
-        LLVMValueRef global = LLVMAddGlobal(ctx->module, LLVMTypeOf(str_val), name);
-        LLVMSetInitializer(global, str_val);
-        LLVMSetLinkage(global, LLVMPrivateLinkage);
-        LLVMSetGlobalConstant(global, 1);
-        ctx->string_constants[i] = global;
+            /* Create global string constant with UTF-16 data */
+            LLVMValueRef str_val = LLVMConstStringInContext(ctx->context, (const char *)ustr, byte_len, 1);
+            LLVMValueRef global = LLVMAddGlobal(ctx->module, LLVMTypeOf(str_val), name);
+            LLVMSetInitializer(global, str_val);
+            /* External linkage so other batches can reference */
+            LLVMSetLinkage(global, ctx->batch_mode == LLVM_BATCH_NONE ? LLVMPrivateLinkage : LLVMExternalLinkage);
+            LLVMSetGlobalConstant(global, 1);
+            ctx->string_constants[i] = global;
+        }
+    } else if (ctx->batch_mode == LLVM_BATCH_SUBSEQUENT) {
+        for (int i = 0; i < code->nstrings; i++) {
+            char name[32];
+            snprintf(name, sizeof(name), "hl_str_%d", i);
+            /* Declare as external reference - opaque type, we just need the symbol */
+            LLVMTypeRef opaque_type = LLVMArrayType(ctx->i8_type, 1);
+            ctx->string_constants[i] = LLVMAddGlobal(ctx->module, opaque_type, name);
+            LLVMSetLinkage(ctx->string_constants[i], LLVMExternalLinkage);
+        }
     }
+    /* LLVM_BATCH_FINAL doesn't need strings */
 
-    /* Create bytes constants */
-    for (int i = 0; i < code->nbytes; i++) {
-        int pos = code->bytes_pos[i];
-        int len = (i + 1 < code->nbytes) ? code->bytes_pos[i + 1] - pos : 0;
-        char name[32];
-        snprintf(name, sizeof(name), ".bytes.%d", i);
+    /* Create bytes constants.
+     * Bytes are raw binary data (resources, etc). Unlike strings which are
+     * UTF-8 in bytecode and need conversion to UTF-16, bytes are used as-is.
+     * In batch mode: first batch defines, others declare as external. */
+    if (ctx->batch_mode == LLVM_BATCH_NONE || ctx->batch_mode == LLVM_BATCH_FIRST) {
+        for (int i = 0; i < code->nbytes; i++) {
+            int pos = code->bytes_pos[i];
+            /* Calculate length: use next entry's pos, or bytes_size for last entry */
+            int len = (i + 1 < code->nbytes) ? code->bytes_pos[i + 1] - pos : code->bytes_size - pos;
+            char name[32];
+            snprintf(name, sizeof(name), "hl_bytes_%d", i);  /* No dot prefix for linking */
 
-        LLVMValueRef bytes_val = LLVMConstStringInContext(
-            ctx->context, code->bytes + pos, len, 1);
-        LLVMValueRef global = LLVMAddGlobal(ctx->module, LLVMTypeOf(bytes_val), name);
-        LLVMSetInitializer(global, bytes_val);
-        LLVMSetLinkage(global, LLVMPrivateLinkage);
-        LLVMSetGlobalConstant(global, 1);
-        ctx->bytes_constants[i] = global;
+            LLVMValueRef bytes_val = LLVMConstStringInContext(
+                ctx->context, code->bytes + pos, len, 1);
+            LLVMValueRef global = LLVMAddGlobal(ctx->module, LLVMTypeOf(bytes_val), name);
+            LLVMSetInitializer(global, bytes_val);
+            /* External linkage so other batches can reference */
+            LLVMSetLinkage(global, ctx->batch_mode == LLVM_BATCH_NONE ? LLVMPrivateLinkage : LLVMExternalLinkage);
+            LLVMSetGlobalConstant(global, 1);
+            ctx->bytes_constants[i] = global;
+        }
+    } else if (ctx->batch_mode == LLVM_BATCH_SUBSEQUENT) {
+        for (int i = 0; i < code->nbytes; i++) {
+            char name[32];
+            snprintf(name, sizeof(name), "hl_bytes_%d", i);
+            /* Declare as external reference */
+            LLVMTypeRef opaque_type = LLVMArrayType(ctx->i8_type, 1);
+            ctx->bytes_constants[i] = LLVMAddGlobal(ctx->module, opaque_type, name);
+            LLVMSetLinkage(ctx->bytes_constants[i], LLVMExternalLinkage);
+        }
     }
+    /* LLVM_BATCH_FINAL doesn't need bytes */
 
     /*
      * Type access: instead of embedding type pointers as globals (which would need
@@ -282,10 +350,16 @@ bool llvm_compile_function(llvm_ctx *ctx, hl_function *f) {
     LLVMPositionBuilderAtEnd(ctx->builder, ctx->entry_block);
     create_function_allocas(ctx, f);
 
-    /* Store function parameters into their allocas */
+    /* Store function parameters into their allocas.
+     * Skip void parameters - fun(void)->X is encoded with nargs=1 and HVOID arg type,
+     * and we skip HVOID when creating the LLVM function type, so param indices differ.
+     */
     hl_type_fun *ft = f->type->fun;
+    int llvm_param_idx = 0;
     for (int i = 0; i < ft->nargs; i++) {
-        LLVMValueRef param = LLVMGetParam(func, i);
+        /* Skip void parameters (no corresponding LLVM param or alloca) */
+        if (!ctx->vreg_allocs[i]) continue;
+        LLVMValueRef param = LLVMGetParam(func, llvm_param_idx++);
         LLVMBuildStore(ctx->builder, param, ctx->vreg_allocs[i]);
     }
 
@@ -348,6 +422,7 @@ bool llvm_compile_function(llvm_ctx *ctx, hl_function *f) {
 static void scan_for_blocks(llvm_ctx *ctx, hl_function *f) {
     ctx->is_block_start = (bool *)calloc(f->nops + 1, sizeof(bool));
     ctx->is_block_start[0] = true;  /* Entry block */
+    ctx->has_exceptions = false;    /* Reset for each function */
 
     for (int i = 0; i < f->nops; i++) {
         hl_opcode *op = &f->ops[i];
@@ -400,6 +475,7 @@ static void scan_for_blocks(llvm_ctx *ctx, hl_function *f) {
         case OTrap:
             ctx->is_block_start[i + 1] = true;
             ctx->is_block_start[i + 1 + op->p2] = true;
+            ctx->has_exceptions = true;  /* Mark function as using setjmp/longjmp */
             break;
 
         case ORet:
@@ -646,6 +722,12 @@ void llvm_optimize(llvm_ctx *ctx) {
     }
 
     LLVMPassBuilderOptionsRef options = LLVMCreatePassBuilderOptions();
+
+    /* Apply custom inline threshold if set (friend's recommendation: 5000) */
+    if (ctx->inline_threshold > 0) {
+        LLVMPassBuilderOptionsSetInlinerThreshold(options, ctx->inline_threshold);
+    }
+
     LLVMErrorRef err = LLVMRunPasses(ctx->module, passes, ctx->target_machine, options);
     if (err) {
         char *msg = LLVMGetErrorMessage(err);
@@ -707,7 +789,15 @@ LLVMValueRef llvm_load_vreg(llvm_ctx *ctx, hl_function *f, int vreg_idx) {
     }
 
     LLVMTypeRef type = llvm_get_type(ctx, f->regs[vreg_idx]);
-    return LLVMBuildLoad2(ctx->builder, type, ctx->vreg_allocs[vreg_idx], "");
+    LLVMValueRef load = LLVMBuildLoad2(ctx->builder, type, ctx->vreg_allocs[vreg_idx], "");
+
+    /* For functions with setjmp/longjmp exception handling, use volatile loads
+     * to prevent LLVM from caching values across longjmp returns. */
+    if (ctx->has_exceptions) {
+        LLVMSetVolatile(load, true);
+    }
+
+    return load;
 }
 
 void llvm_store_vreg(llvm_ctx *ctx, hl_function *f, int vreg_idx, LLVMValueRef value) {
@@ -721,7 +811,13 @@ void llvm_store_vreg(llvm_ctx *ctx, hl_function *f, int vreg_idx, LLVMValueRef v
         return;
     }
 
-    LLVMBuildStore(ctx->builder, value, ctx->vreg_allocs[vreg_idx]);
+    LLVMValueRef store = LLVMBuildStore(ctx->builder, value, ctx->vreg_allocs[vreg_idx]);
+
+    /* For functions with setjmp/longjmp exception handling, use volatile stores
+     * to ensure stores before throw are not optimized away. */
+    if (ctx->has_exceptions) {
+        LLVMSetVolatile(store, true);
+    }
 }
 
 LLVMBasicBlockRef llvm_get_block_for_offset(llvm_ctx *ctx, int current_op, int offset) {

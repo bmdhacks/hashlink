@@ -41,6 +41,13 @@ static void add_noreturn(llvm_ctx *ctx, LLVMValueRef func) {
     LLVMAddAttributeAtIndex(func, LLVMAttributeFunctionIndex, attr);
 }
 
+/* Add returns_twice attribute to a function (required for setjmp) */
+static void add_returns_twice(llvm_ctx *ctx, LLVMValueRef func) {
+    unsigned kind = LLVMGetEnumAttributeKindForName("returns_twice", 13);
+    LLVMAttributeRef attr = LLVMCreateEnumAttribute(ctx->context, kind, 0);
+    LLVMAddAttributeAtIndex(func, LLVMAttributeFunctionIndex, attr);
+}
+
 void llvm_declare_runtime(llvm_ctx *ctx) {
     LLVMTypeRef ptr = ctx->ptr_type;
     LLVMTypeRef i32 = ctx->i32_type;
@@ -150,6 +157,12 @@ void llvm_declare_runtime(llvm_ctx *ctx) {
     {
         LLVMTypeRef params[] = { ptr, ptr, i32, ptr };
         ctx->rt_dyn_call_safe = declare_func(ctx, "hl_dyn_call_safe", ptr, params, 4, false);
+    }
+
+    /* hl_dyn_call_obj(vdynamic*, hl_type*, int, void**, vdynamic*) -> void* */
+    {
+        LLVMTypeRef params[] = { ptr, ptr, i32, ptr, ptr };
+        ctx->rt_dyn_call_obj = declare_func(ctx, "hl_dyn_call_obj", ptr, params, 5, false);
     }
 
     /* hl_get_thread() -> hl_thread_info* */
@@ -263,11 +276,26 @@ void llvm_declare_runtime(llvm_ctx *ctx) {
         ctx->rt_hash_gen = declare_func(ctx, "hl_hash_gen", i32, params, 2, false);
     }
 
+    /* hl_dyn_compare(vdynamic*, vdynamic*) -> int
+     * Returns 0 if equal, negative if a < b, positive if a > b */
+    {
+        LLVMTypeRef params[] = { ptr, ptr };
+        ctx->rt_dyn_compare = declare_func(ctx, "hl_dyn_compare", i32, params, 2, false);
+    }
+
+    /* hl_str_cmp(vstring*, vstring*) -> int
+     * Compares two strings, returns 0 if equal, non-zero otherwise */
+    {
+        LLVMTypeRef params[] = { ptr, ptr };
+        ctx->rt_str_cmp = declare_func(ctx, "hl_str_cmp", i32, params, 2, false);
+    }
+
     /* setjmp/longjmp for exception handling */
     /* setjmp(jmp_buf) -> int */
     {
         LLVMTypeRef params[] = { ptr };
         ctx->rt_setjmp = declare_func(ctx, "setjmp", i32, params, 1, false);
+        add_returns_twice(ctx, ctx->rt_setjmp);
     }
 
     /* longjmp(jmp_buf, int) -> noreturn */
@@ -275,6 +303,17 @@ void llvm_declare_runtime(llvm_ctx *ctx) {
         LLVMTypeRef params[] = { ptr, i32 };
         ctx->rt_longjmp = declare_func(ctx, "longjmp", void_t, params, 2, false);
         add_noreturn(ctx, ctx->rt_longjmp);
+    }
+
+    /* hlt_void - global type constant for null object types */
+    {
+        LLVMValueRef existing = LLVMGetNamedGlobal(ctx->module, "hlt_void");
+        if (existing) {
+            ctx->rt_hlt_void = existing;
+        } else {
+            ctx->rt_hlt_void = LLVMAddGlobal(ctx->module, ctx->ptr_type, "hlt_void");
+            LLVMSetLinkage(ctx->rt_hlt_void, LLVMExternalLinkage);
+        }
     }
 
     /* aot_get_type(int) -> void* - AOT runtime type accessor

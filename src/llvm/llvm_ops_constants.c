@@ -19,7 +19,19 @@ void llvm_emit_constants(llvm_ctx *ctx, hl_function *f, hl_opcode *op, int op_id
         /* dst = ints[p2] */
         int dst = op->p1;
         int val = ctx->code->ints[op->p2];
-        LLVMValueRef const_val = LLVMConstInt(ctx->i32_type, val, true);
+        hl_type *t = f->regs[dst];
+        LLVMTypeRef target_type;
+        /* Choose type based on destination register */
+        if (t->kind == HI64 || t->kind == HGUID) {
+            target_type = ctx->i64_type;
+        } else if (t->kind == HUI8 || t->kind == HBOOL) {
+            target_type = ctx->i8_type;
+        } else if (t->kind == HUI16) {
+            target_type = ctx->i16_type;
+        } else {
+            target_type = ctx->i32_type;
+        }
+        LLVMValueRef const_val = LLVMConstInt(target_type, val, true);
         llvm_store_vreg(ctx, f, dst, const_val);
         break;
     }

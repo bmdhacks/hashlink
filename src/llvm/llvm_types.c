@@ -65,8 +65,9 @@ LLVMTypeRef llvm_get_type(llvm_ctx *ctx, hl_type *t) {
     case HMETHOD:
     case HSTRUCT:
     case HPACKED:
-    case HGUID:
         return ctx->ptr_type;
+    case HGUID:
+        return ctx->i64_type;  /* HGUID is a 64-bit integer, not a pointer */
 
     default:
         return ctx->ptr_type;
@@ -87,17 +88,19 @@ LLVMTypeRef llvm_get_function_type(llvm_ctx *ctx, hl_type *t) {
         ret_type = ctx->void_type;
     }
 
-    /* Get parameter types */
+    /* Get parameter types, skipping void args (fun(void)->X encodes as nargs=1 with HVOID arg) */
     int nargs = ft->nargs;
+    int actual_nargs = 0;
     LLVMTypeRef *param_types = NULL;
     if (nargs > 0) {
         param_types = (LLVMTypeRef *)malloc(sizeof(LLVMTypeRef) * nargs);
         for (int i = 0; i < nargs; i++) {
-            param_types[i] = llvm_get_type(ctx, ft->args[i]);
+            if (ft->args[i] && ft->args[i]->kind == HVOID) continue;
+            param_types[actual_nargs++] = llvm_get_type(ctx, ft->args[i]);
         }
     }
 
-    LLVMTypeRef fn_type = LLVMFunctionType(ret_type, param_types, nargs, false);
+    LLVMTypeRef fn_type = LLVMFunctionType(ret_type, param_types, actual_nargs, false);
 
     if (param_types) free(param_types);
 
@@ -131,5 +134,7 @@ bool llvm_is_float_type(hl_type *t) {
 }
 
 bool llvm_is_ptr_type(hl_type *t) {
-    return t && t->kind >= HBYTES;
+    if (!t) return false;
+    if (t->kind == HGUID) return false;  /* HGUID is a 64-bit integer value type */
+    return t->kind >= HBYTES;
 }

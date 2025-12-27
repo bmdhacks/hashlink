@@ -49,6 +49,14 @@ typedef enum {
     LLVM_OPT_AGGRESSIVE = 3
 } llvm_opt_level;
 
+/* Batch compilation mode */
+typedef enum {
+    LLVM_BATCH_NONE = 0,      /* Single file mode (current behavior) */
+    LLVM_BATCH_FIRST,         /* First batch: defines globals/strings/bytes */
+    LLVM_BATCH_SUBSEQUENT,    /* Later batches: external refs only */
+    LLVM_BATCH_FINAL          /* Final: entry point only, no function definitions */
+} llvm_batch_mode;
+
 /* LLVM codegen context */
 typedef struct {
     /* LLVM core objects */
@@ -66,6 +74,7 @@ typedef struct {
     LLVMValueRef *vreg_allocs;          /* Stack allocas for each vreg */
     int num_vregs;
     bool *is_block_start;               /* Marks which opcodes start blocks */
+    bool has_exceptions;                /* True if function uses OTrap (setjmp/longjmp) */
 
     /* HashLink module being compiled */
     hl_code *code;
@@ -115,6 +124,7 @@ typedef struct {
     LLVMValueRef rt_make_dyn;
     LLVMValueRef rt_dyn_call;
     LLVMValueRef rt_dyn_call_safe;
+    LLVMValueRef rt_dyn_call_obj;
     LLVMValueRef rt_get_thread;
 
     /* Dynamic field access */
@@ -138,9 +148,18 @@ typedef struct {
     LLVMValueRef rt_hash;
     LLVMValueRef rt_hash_gen;
 
+    /* Dynamic comparison */
+    LLVMValueRef rt_dyn_compare;
+
+    /* String comparison */
+    LLVMValueRef rt_str_cmp;
+
     /* setjmp/longjmp for exceptions */
     LLVMValueRef rt_setjmp;
     LLVMValueRef rt_longjmp;
+
+    /* Global type constants */
+    LLVMValueRef rt_hlt_void;  /* &hlt_void for null object type */
 
     /* Common LLVM types */
     LLVMTypeRef void_type;
@@ -163,6 +182,15 @@ typedef struct {
     /* Options */
     llvm_opt_level opt_level;
     bool emit_debug_info;
+    int inline_threshold;       /* 0 = use default, >0 = custom threshold */
+    int fast_math;              /* 0=off, 1=safe (no nnan/ninf/nsz), 2=full */
+    const char *target_cpu;     /* NULL = auto-detect, else override */
+    const char *target_features;/* NULL = auto-detect, else override/append */
+
+    /* Batch compilation state */
+    llvm_batch_mode batch_mode;
+    int batch_start;    /* First function index for this batch */
+    int batch_end;      /* Last function index (exclusive) */
 
     /* Embedded bytecode for standalone binary */
     const unsigned char *bytecode_data;
@@ -218,6 +246,9 @@ LLVMValueRef llvm_get_type_ptr(llvm_ctx *ctx, int type_idx);
 LLVMValueRef llvm_get_string(llvm_ctx *ctx, int str_idx);
 LLVMValueRef llvm_get_bytes(llvm_ctx *ctx, int bytes_idx);
 LLVMValueRef llvm_create_entry_alloca(llvm_ctx *ctx, LLVMTypeRef type, const char *name);
+
+/* Null<T> unboxing - loads value from Null wrapper with null check */
+LLVMValueRef llvm_unbox_null(llvm_ctx *ctx, LLVMValueRef wrapper_ptr, hl_type *inner_type);
 
 /* Entry point generation */
 bool llvm_generate_entry_point(llvm_ctx *ctx, int entry_findex);

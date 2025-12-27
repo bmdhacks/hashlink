@@ -59,14 +59,31 @@ static const char *type_kind_name(hl_type_kind k) {
     }
 }
 
+static int print_depth = 0;
+
+/* Print uchar string (16-bit) as ASCII */
+static void print_ustr(const uchar *s) {
+    if (!s) return;
+    while (*s) {
+        putchar((char)*s);
+        s++;
+    }
+}
+
 static void print_type(hl_type *t) {
     if (!t) {
         printf("null");
         return;
     }
+    if (print_depth > 3) {
+        printf("%s(...)", type_kind_name(t->kind));
+        return;
+    }
+    print_depth++;
     printf("%s", type_kind_name(t->kind));
-    if ((t->kind == HOBJ || t->kind == HSTRUCT) && t->obj && t->obj->name) {
-        printf("(%ls", (wchar_t*)t->obj->name);
+    if ((t->kind == HOBJ || t->kind == HSTRUCT) && t->obj) {
+        printf("(");
+        if (t->obj->name) print_ustr(t->obj->name);
         printf(", %d fields", t->obj->nfields);
         if (t->obj->super) {
             printf(", super=");
@@ -74,7 +91,13 @@ static void print_type(hl_type *t) {
         }
         printf(")");
     } else if (t->kind == HVIRTUAL && t->virt) {
-        printf("(%d fields)", t->virt->nfields);
+        printf("(%d fields: ", t->virt->nfields);
+        for (int i = 0; i < t->virt->nfields && i < 4; i++) {
+            if (i > 0) printf(", ");
+            print_type(t->virt->fields[i].t);
+        }
+        if (t->virt->nfields > 4) printf(", ...");
+        printf(")");
     } else if ((t->kind == HFUN || t->kind == HMETHOD) && t->fun) {
         printf("(");
         for (int i = 0; i < t->fun->nargs; i++) {
@@ -83,9 +106,16 @@ static void print_type(hl_type *t) {
         }
         printf(")->");
         print_type(t->fun->ret);
-    } else if (t->kind == HENUM && t->tenum && t->tenum->name) {
-        printf("(%ls, %d constructs)", (wchar_t*)t->tenum->name, t->tenum->nconstructs);
+    } else if (t->kind == HENUM && t->tenum) {
+        printf("(");
+        if (t->tenum->name) print_ustr(t->tenum->name);
+        printf(", %d constructs)", t->tenum->nconstructs);
+    } else if (t->kind == HNULL && t->tparam) {
+        printf("(");
+        print_type(t->tparam);
+        printf(")");
     }
+    print_depth--;
 }
 
 static void dump_function(hl_code *c, hl_function *f, int verbose) {
@@ -98,12 +128,11 @@ static void dump_function(hl_code *c, hl_function *f, int verbose) {
 
     if (verbose) {
         printf("  Register types:\n");
-        for (int i = 0; i < f->nregs && i < 20; i++) {
+        for (int i = 0; i < f->nregs; i++) {
             printf("    r%d: ", i);
             print_type(f->regs[i]);
             printf("\n");
         }
-        if (f->nregs > 20) printf("    ... (%d more)\n", f->nregs - 20);
     }
 
     printf("  Code:\n");
@@ -127,12 +156,40 @@ static void dump_function(hl_code *c, hl_function *f, int verbose) {
                 printf("  ; r%d = %s", op->p1, op->p2 ? "true" : "false");
                 break;
             case OCall0:
+                printf("  ; call F%d()", op->p2);
+                break;
             case OCall1:
+                printf("  ; call F%d(r%d)", op->p2, op->p3);
+                break;
             case OCall2:
+                /* extra is a direct int cast, not array */
+                printf("  ; call F%d(r%d, r%d)", op->p2, op->p3, (int)(int_val)op->extra);
+                break;
             case OCall3:
+                printf("  ; call F%d(r%d, r%d, r%d)", op->p2, op->p3, op->extra[0], op->extra[1]);
+                break;
             case OCall4:
+                printf("  ; call F%d(r%d, r%d, r%d, r%d)", op->p2, op->p3, op->extra[0], op->extra[1], op->extra[2]);
+                break;
             case OCallN:
                 printf("  ; call F%d", op->p2);
+                break;
+            case OCallMethod:
+            case OCallThis:
+                /* p1=dst, p2=method_idx, p3=nargs, extra[0..nargs-1]=arg regs */
+                printf("  ; method[%d] args=[", op->p2);
+                for (int j = 0; j < op->p3; j++) {
+                    printf("r%d%s", op->extra[j], j < op->p3-1 ? "," : "");
+                }
+                printf("]");
+                break;
+            case OCallClosure:
+                /* p1=dst, p2=closure_reg, p3=nargs, extra[0..nargs-1]=arg regs */
+                printf("  ; call r%d args=[", op->p2);
+                for (int j = 0; j < op->p3; j++) {
+                    printf("r%d%s", op->extra[j], j < op->p3-1 ? "," : "");
+                }
+                printf("]");
                 break;
             case OJAlways:
                 printf("  ; goto %d", (i + 1) + op->p1);

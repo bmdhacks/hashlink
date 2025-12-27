@@ -75,7 +75,8 @@ void llvm_emit_objects(llvm_ctx *ctx, hl_function *f, hl_opcode *op, int op_idx)
         /* dst = obj.field (dynamic field access by hash) */
         int dst = op->p1;
         int obj = op->p2;
-        int field_hash = op->p3;
+        int str_idx = op->p3;  /* p3 is string index, not hash */
+        int field_hash = hl_hash_utf8(ctx->code->strings[str_idx]);
         hl_type *dst_type = f->regs[dst];
 
         LLVMValueRef obj_ptr = llvm_load_vreg(ctx, f, obj);
@@ -103,7 +104,8 @@ void llvm_emit_objects(llvm_ctx *ctx, hl_function *f, hl_opcode *op, int op_idx)
                 ctx->rt_dyn_geti, args, 3, "");
             break;
         }
-        case HI64: {
+        case HI64:
+        case HGUID: {
             LLVMValueRef args[] = { obj_ptr, hash_val };
             result = LLVMBuildCall2(ctx->builder, LLVMGlobalGetValueType(ctx->rt_dyn_geti64),
                 ctx->rt_dyn_geti64, args, 2, "");
@@ -145,7 +147,8 @@ void llvm_emit_objects(llvm_ctx *ctx, hl_function *f, hl_opcode *op, int op_idx)
     case ODynSet: {
         /* obj.field = val (dynamic field set by hash) */
         int obj = op->p1;
-        int field_hash = op->p2;
+        int str_idx = op->p2;  /* p2 is string index, not hash */
+        int field_hash = hl_hash_utf8(ctx->code->strings[str_idx]);
         int src = op->p3;
         hl_type *src_type = f->regs[src];
 
@@ -180,7 +183,8 @@ void llvm_emit_objects(llvm_ctx *ctx, hl_function *f, hl_opcode *op, int op_idx)
                 ctx->rt_dyn_seti, args, 4, "");
             break;
         }
-        case HI64: {
+        case HI64:
+        case HGUID: {
             LLVMValueRef args[] = { obj_ptr, hash_val, val };
             LLVMBuildCall2(ctx->builder, LLVMGlobalGetValueType(ctx->rt_dyn_seti64),
                 ctx->rt_dyn_seti64, args, 3, "");
