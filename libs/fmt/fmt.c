@@ -153,6 +153,46 @@ DEFINE_PRIM(_BOOL, jpg_decode, _BYTES _I32 _BYTES _I32 _I32 _I32 _I32 _I32);
 DEFINE_PRIM(_BOOL, png_decode, _BYTES _I32 _BYTES _I32 _I32 _I32 _I32 _I32);
 DEFINE_PRIM(_VOID, img_scale, _BYTES _I32 _I32 _I32 _I32 _BYTES _I32 _I32 _I32 _I32 _I32);
 
+/* ------------------------------------------------- ASTC --------------------------------------------------- */
+
+HL_PRIM bool HL_NAME(astc_info)(vbyte *data, int len, int *width, int *height, int *blockX, int *blockY, int *dataOffset) {
+	if (len < 16)
+		return false;
+
+	unsigned int magic = data[0] | (data[1] << 8) | (data[2] << 16) | (data[3] << 24);
+	if (magic != 0x5CA1AB13)
+		return false;
+
+	*blockX = data[4];
+	*blockY = data[5];
+
+	*width = data[7] | (data[8] << 8) | (data[9] << 16);
+	*height = data[10] | (data[11] << 8) | (data[12] << 16);
+
+	*dataOffset = 16;
+	return true;
+}
+
+HL_PRIM int HL_NAME(astc_gl_format)(int blockX, int blockY) {
+	if (blockX == 4 && blockY == 4) return 0x93B0;
+	if (blockX == 5 && blockY == 4) return 0x93B1;
+	if (blockX == 5 && blockY == 5) return 0x93B2;
+	if (blockX == 6 && blockY == 5) return 0x93B3;
+	if (blockX == 6 && blockY == 6) return 0x93B4;
+	if (blockX == 8 && blockY == 5) return 0x93B5;
+	if (blockX == 8 && blockY == 6) return 0x93B6;
+	if (blockX == 8 && blockY == 8) return 0x93B7;
+	if (blockX == 10 && blockY == 5) return 0x93B8;
+	if (blockX == 10 && blockY == 6) return 0x93B9;
+	if (blockX == 10 && blockY == 8) return 0x93BA;
+	if (blockX == 10 && blockY == 10) return 0x93BB;
+	if (blockX == 12 && blockY == 10) return 0x93BC;
+	if (blockX == 12 && blockY == 12) return 0x93BD;
+	return 0;
+}
+
+DEFINE_PRIM(_BOOL, astc_info, _BYTES _I32 _REF(_I32) _REF(_I32) _REF(_I32) _REF(_I32) _REF(_I32));
+DEFINE_PRIM(_I32, astc_gl_format, _I32 _I32);
 
 /* ------------------------------------------------- ZLIB --------------------------------------------------- */
 
