@@ -118,11 +118,211 @@ static void print_type(hl_type *t) {
     print_depth--;
 }
 
+/* Print full type details with all indices */
+static void print_type_full(hl_type *t, int indent) {
+    if (!t) {
+        printf("null\n");
+        return;
+    }
+    printf("%s", type_kind_name(t->kind));
+
+    if ((t->kind == HOBJ || t->kind == HSTRUCT) && t->obj) {
+        printf("(");
+        if (t->obj->name) print_ustr(t->obj->name);  /* Fully qualified: package.ClassName */
+        printf(", %d fields, %d protos)\n", t->obj->nfields, t->obj->nproto);
+        /* Print fields */
+        for (int i = 0; i < t->obj->nfields; i++) {
+            printf("%*s  F%d: ", indent, "", i);
+            print_ustr(t->obj->fields[i].name);
+            printf(" : ");
+            print_type(t->obj->fields[i].t);
+            printf("\n");
+        }
+        /* Print proto methods */
+        for (int i = 0; i < t->obj->nproto; i++) {
+            printf("%*s  P%d: ", indent, "", i);
+            print_ustr(t->obj->proto[i].name);
+            printf(" -> F%d\n", t->obj->proto[i].findex);
+        }
+        if (t->obj->super) {
+            printf("%*s  super: ", indent, "");
+            print_type(t->obj->super);
+            printf("\n");
+        }
+    } else if (t->kind == HVIRTUAL && t->virt) {
+        printf("(%d vfields)\n", t->virt->nfields);
+        for (int i = 0; i < t->virt->nfields; i++) {
+            printf("%*s  V%d: ", indent, "", i);
+            print_ustr(t->virt->fields[i].name);
+            printf(" : ");
+            print_type(t->virt->fields[i].t);
+            printf("\n");
+        }
+    } else if ((t->kind == HFUN || t->kind == HMETHOD) && t->fun) {
+        printf("(");
+        for (int i = 0; i < t->fun->nargs; i++) {
+            if (i > 0) printf(", ");
+            print_type(t->fun->args[i]);
+        }
+        printf(") -> ");
+        print_type(t->fun->ret);
+        printf("\n");
+    } else if (t->kind == HENUM && t->tenum) {
+        printf("(");
+        if (t->tenum->name) print_ustr(t->tenum->name);  /* Fully qualified: package.EnumName */
+        printf(", %d constructs)\n", t->tenum->nconstructs);
+        for (int ci = 0; ci < t->tenum->nconstructs; ci++) {
+            hl_enum_construct *c = &t->tenum->constructs[ci];
+            printf("%*s  C%d: ", indent, "", ci);
+            print_ustr(c->name);
+            printf("(");
+            for (int pi = 0; pi < c->nparams; pi++) {
+                if (pi > 0) printf(", ");
+                printf("P%d:", pi);
+                print_type(c->params[pi]);
+            }
+            printf(") size=%d\n", c->size);
+        }
+    } else if (t->kind == HNULL && t->tparam) {
+        printf("(");
+        print_type(t->tparam);
+        printf(")\n");
+    } else if (t->kind == HABSTRACT && t->abs_name) {
+        printf("(");
+        print_ustr(t->abs_name);
+        printf(")\n");
+    } else if (t->kind == HREF && t->tparam) {
+        printf("(");
+        print_type(t->tparam);
+        printf(")\n");
+    } else if (t->kind == HARRAY) {
+        printf("\n");
+    } else {
+        printf("\n");
+    }
+}
+
+/* Find function name by searching type protos (reverse lookup) */
+static void find_function_name(hl_code *c, int findex, const uchar **out_class, const uchar **out_method) {
+    *out_class = NULL;
+    *out_method = NULL;
+    for (int i = 0; i < c->ntypes; i++) {
+        hl_type *t = &c->types[i];
+        if ((t->kind == HOBJ || t->kind == HSTRUCT) && t->obj) {
+            for (int j = 0; j < t->obj->nproto; j++) {
+                if (t->obj->proto[j].findex == findex) {
+                    *out_class = t->obj->name;
+                    *out_method = t->obj->proto[j].name;
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/* Find type index in code->types array */
+static int find_type_index(hl_code *c, hl_type *t) {
+    if (!t) return -1;
+    for (int i = 0; i < c->ntypes; i++) {
+        if (&c->types[i] == t) return i;
+    }
+    return -1;
+}
+
+/* Print type with T index prefix */
+static void print_type_with_index(hl_code *c, hl_type *t) {
+    int idx = find_type_index(c, t);
+    if (idx >= 0) {
+        printf("T%d ", idx);
+    }
+    print_type(t);
+}
+
+/* Print function name by index - always shows F<index>, plus name if found */
+static void print_func_name(hl_code *c, int findex) {
+    printf("F%d", findex);
+    /* Check if it's a native */
+    for (int i = 0; i < c->nnatives; i++) {
+        if (c->natives[i].findex == findex) {
+            printf(" %s@%s", c->natives[i].name, c->natives[i].lib);
+            return;
+        }
+    }
+    /* Search type protos */
+    const uchar *cls = NULL, *method = NULL;
+    find_function_name(c, findex, &cls, &method);
+    if (cls && method) {
+        printf(" ");
+        print_ustr(cls);
+        printf("::");
+        print_ustr(method);
+    }
+}
+
 static void dump_function(hl_code *c, hl_function *f, int verbose) {
+    /* Get qualified name - try multiple sources */
+    hl_type_obj *obj = fun_obj(f);
+    const uchar *fname = fun_field_name(f);
+
+    /* If not available via fun_obj/fun_field_name, search type protos */
+    const uchar *lookup_class = NULL;
+    const uchar *lookup_method = NULL;
+    if (!obj && !fname) {
+        find_function_name(c, f->findex, &lookup_class, &lookup_method);
+    }
+
     printf("\n=== Function %d ===\n", f->findex);
+
+    /* Show fully qualified name (package.Class::method) if available */
+    printf("  Name: ");
+    if (obj && obj->name) {
+        print_ustr(obj->name);  /* Already includes package path */
+        printf("::");
+        if (fname) print_ustr(fname);
+        printf("\n");
+    } else if (fname) {
+        print_ustr(fname);
+        printf("\n");
+    } else if (lookup_class && lookup_method) {
+        /* Found via proto lookup */
+        print_ustr(lookup_class);
+        printf("::");
+        print_ustr(lookup_method);
+        printf("\n");
+    } else {
+        /* No name info - try to infer from type or show anonymous */
+        if (f->type && (f->type->kind == HFUN || f->type->kind == HMETHOD) && f->type->fun) {
+            /* If first arg is an object type, might be a method */
+            if (f->type->fun->nargs > 0 && f->type->fun->args[0]) {
+                hl_type *first_arg = f->type->fun->args[0];
+                if ((first_arg->kind == HOBJ || first_arg->kind == HSTRUCT) && first_arg->obj && first_arg->obj->name) {
+                    printf("(method of ");
+                    print_ustr(first_arg->obj->name);
+                    printf(")\n");
+                } else {
+                    printf("(anonymous)\n");
+                }
+            } else {
+                printf("(anonymous)\n");
+            }
+        } else {
+            printf("(anonymous)\n");
+        }
+    }
+
     printf("  Type: ");
-    print_type(f->type);
+    print_type_with_index(c, f->type);
     printf("\n");
+
+    /* Show source file from debug info */
+    if (c->hasdebug && f->debug && f->nops > 0) {
+        int file_idx = f->debug[0] & 0x7FFFFFFF;
+        int line = f->debug[1];
+        if (file_idx < c->ndebugfiles) {
+            printf("  Source: %s:%d\n", c->debugfiles[file_idx], line);
+        }
+    }
+
     printf("  Registers: %d\n", f->nregs);
     printf("  Opcodes: %d\n", f->nops);
 
@@ -130,7 +330,7 @@ static void dump_function(hl_code *c, hl_function *f, int verbose) {
         printf("  Register types:\n");
         for (int i = 0; i < f->nregs; i++) {
             printf("    r%d: ", i);
-            print_type(f->regs[i]);
+            print_type_with_index(c, f->regs[i]);
             printf("\n");
         }
     }
@@ -156,23 +356,34 @@ static void dump_function(hl_code *c, hl_function *f, int verbose) {
                 printf("  ; r%d = %s", op->p1, op->p2 ? "true" : "false");
                 break;
             case OCall0:
-                printf("  ; call F%d()", op->p2);
+                printf("  ; call ");
+                print_func_name(c, op->p2);
+                printf("()");
                 break;
             case OCall1:
-                printf("  ; call F%d(r%d)", op->p2, op->p3);
+                printf("  ; call ");
+                print_func_name(c, op->p2);
+                printf("(r%d)", op->p3);
                 break;
             case OCall2:
                 /* extra is a direct int cast, not array */
-                printf("  ; call F%d(r%d, r%d)", op->p2, op->p3, (int)(int_val)op->extra);
+                printf("  ; call ");
+                print_func_name(c, op->p2);
+                printf("(r%d, r%d)", op->p3, (int)(int_val)op->extra);
                 break;
             case OCall3:
-                printf("  ; call F%d(r%d, r%d, r%d)", op->p2, op->p3, op->extra[0], op->extra[1]);
+                printf("  ; call ");
+                print_func_name(c, op->p2);
+                printf("(r%d, r%d, r%d)", op->p3, op->extra[0], op->extra[1]);
                 break;
             case OCall4:
-                printf("  ; call F%d(r%d, r%d, r%d, r%d)", op->p2, op->p3, op->extra[0], op->extra[1], op->extra[2]);
+                printf("  ; call ");
+                print_func_name(c, op->p2);
+                printf("(r%d, r%d, r%d, r%d)", op->p3, op->extra[0], op->extra[1], op->extra[2]);
                 break;
             case OCallN:
-                printf("  ; call F%d", op->p2);
+                printf("  ; call ");
+                print_func_name(c, op->p2);
                 break;
             case OCallMethod:
             case OCallThis:
@@ -224,8 +435,86 @@ static void dump_function(hl_code *c, hl_function *f, int verbose) {
             case ONew:
                 printf("  ; r%d = new", op->p1);
                 break;
+            case OStaticClosure:
+                /* p1=dst, p2=findex */
+                printf("  ; r%d = closure(", op->p1);
+                print_func_name(c, op->p2);
+                printf(")");
+                break;
+            case OInstanceClosure:
+                /* p1=dst, p2=findex, p3=obj_reg */
+                printf("  ; r%d = closure(", op->p1);
+                print_func_name(c, op->p2);
+                printf(", r%d)", op->p3);
+                break;
+            case OVirtualClosure:
+                /* p1=dst, p2=obj_reg, p3=proto_idx */
+                printf("  ; r%d = vclosure(r%d, proto[%d])", op->p1, op->p2, op->p3);
+                break;
+            case OFloat:
+                if (op->p2 >= 0 && op->p2 < c->nfloats)
+                    printf("  ; r%d = %g", op->p1, c->floats[op->p2]);
+                break;
+            case OBytes:
+                printf("  ; r%d = bytes[%d]", op->p1, op->p2);
+                break;
+            case OMakeEnum:
+                /* p1=dst, p2=construct_idx, p3=nargs */
+                {
+                    hl_type *et = f->regs[op->p1];
+                    if (et && et->kind == HENUM && et->tenum && op->p2 < et->tenum->nconstructs) {
+                        hl_enum_construct *ec = &et->tenum->constructs[op->p2];
+                        printf("  ; ");
+                        print_ustr(et->tenum->name);
+                        printf("::");
+                        print_ustr(ec->name);
+                        printf("[C%d]", op->p2);
+                    }
+                }
+                break;
+            case OEnumAlloc:
+                /* p1=dst, p2=type_idx */
+                {
+                    hl_type *et = f->regs[op->p1];
+                    if (et && et->kind == HENUM && et->tenum) {
+                        printf("  ; alloc ");
+                        print_ustr(et->tenum->name);
+                    }
+                }
+                break;
+            case OEnumIndex:
+                printf("  ; r%d = r%d.index", op->p1, op->p2);
+                break;
+            case OEnumField:
+                /* p1=dst, p2=enum_reg, p3=construct_idx, extra=field_idx */
+                {
+                    hl_type *et = f->regs[op->p2];
+                    int construct_idx = op->p3;
+                    int field_idx = (int)(int_val)op->extra;
+                    if (et && et->kind == HENUM && et->tenum && construct_idx < et->tenum->nconstructs) {
+                        hl_enum_construct *ec = &et->tenum->constructs[construct_idx];
+                        printf("  ; ");
+                        print_ustr(et->tenum->name);
+                        printf("::");
+                        print_ustr(ec->name);
+                        printf("[C%d].field[P%d]", construct_idx, field_idx);
+                    }
+                }
+                break;
+            case OSetEnumField:
+                /* p1=enum_reg, p2=field_idx, p3=value_reg - always construct 0 */
+                printf("  ; r%d[C0].field[P%d] = r%d", op->p1, op->p2, op->p3);
+                break;
             default:
                 break;
+        }
+        /* Print debug info (file:line) */
+        if (c->hasdebug && f->debug) {
+            int file_idx = f->debug[i * 2] & 0x7FFFFFFF;
+            int line = f->debug[i * 2 + 1];
+            if (file_idx < c->ndebugfiles && line > 0) {
+                printf("  @ %s:%d", c->debugfiles[file_idx], line);
+            }
         }
         printf("\n");
     }
@@ -300,8 +589,119 @@ int main(int argc, char **argv) {
         for (int i = 0; i < code->nnatives; i++) {
             hl_native *n = &code->natives[i];
             printf("  F%d: %s@%s ", n->findex, n->name, n->lib);
-            print_type(n->t);
+            print_type_with_index(code, n->t);
             printf("\n");
+        }
+    }
+
+    /* Comprehensive dump when -a flag is set */
+    if (dump_all) {
+        /* String literals */
+        printf("\n=== String Literals (%d) ===\n", code->nstrings);
+        for (int i = 0; i < code->nstrings; i++) {
+            printf("  S%d: \"%s\"\n", i, code->strings[i]);
+        }
+
+        /* Integer constants */
+        printf("\n=== Integer Constants (%d) ===\n", code->nints);
+        for (int i = 0; i < code->nints; i++) {
+            printf("  I%d: %d (0x%08x)\n", i, code->ints[i], code->ints[i]);
+        }
+
+        /* Float constants */
+        printf("\n=== Float Constants (%d) ===\n", code->nfloats);
+        for (int i = 0; i < code->nfloats; i++) {
+            printf("  FL%d: %g\n", i, code->floats[i]);
+        }
+
+        /* Bytes constants */
+        if (code->nbytes > 0) {
+            printf("\n=== Bytes Constants (%d) ===\n", code->nbytes);
+            for (int i = 0; i < code->nbytes; i++) {
+                int pos = code->bytes_pos[i];
+                int end = (i + 1 < code->nbytes) ? code->bytes_pos[i + 1] : code->bytes_size;
+                int len = end - pos;
+                printf("  B%d: [%d bytes] ", i, len);
+                /* Print first 32 bytes as hex */
+                for (int j = pos; j < end && j < pos + 32; j++) {
+                    printf("%02x ", (unsigned char)code->bytes[j]);
+                }
+                if (len > 32) printf("...");
+                printf("\n");
+            }
+        }
+
+        /* Debug source files */
+        if (code->hasdebug && code->ndebugfiles > 0) {
+            printf("\n=== Debug Source Files (%d) ===\n", code->ndebugfiles);
+            for (int i = 0; i < code->ndebugfiles; i++) {
+                printf("  D%d: %s\n", i, code->debugfiles[i]);
+            }
+        }
+
+        /* Types (full details) */
+        printf("\n=== Types (%d) ===\n", code->ntypes);
+        for (int i = 0; i < code->ntypes; i++) {
+            printf("  T%d: ", i);
+            print_type_full(&code->types[i], 4);
+        }
+
+        /* Global variables */
+        printf("\n=== Global Variables (%d) ===\n", code->nglobals);
+        for (int i = 0; i < code->nglobals; i++) {
+            printf("  G%d: ", i);
+            print_type_with_index(code, code->globals[i]);
+            printf("\n");
+        }
+
+        /* Constants (pre-initialized globals) */
+        if (code->nconstants > 0) {
+            printf("\n=== Constants (%d) ===\n", code->nconstants);
+            for (int i = 0; i < code->nconstants; i++) {
+                hl_constant *cst = &code->constants[i];
+                hl_type *gt = code->globals[cst->global];
+                printf("  C%d: G%d ", i, cst->global);
+                print_type_with_index(code, gt);
+                printf("\n");
+                /* Show field initializers */
+                if (gt && (gt->kind == HOBJ || gt->kind == HSTRUCT) && gt->obj) {
+                    for (int j = 0; j < cst->nfields && j < gt->obj->nfields; j++) {
+                        int idx = cst->fields[j];
+                        hl_type *ft = gt->obj->fields[j].t;
+                        printf("       F%d ", j);
+                        print_ustr(gt->obj->fields[j].name);
+                        printf(" = ");
+                        /* Decode value based on field type */
+                        if (ft) {
+                            switch (ft->kind) {
+                                case HI32:
+                                    if (idx < code->nints)
+                                        printf("I%d (%d)", idx, code->ints[idx]);
+                                    else
+                                        printf("I%d", idx);
+                                    break;
+                                case HF64:
+                                    if (idx < code->nfloats)
+                                        printf("FL%d (%g)", idx, code->floats[idx]);
+                                    else
+                                        printf("FL%d", idx);
+                                    break;
+                                case HBYTES:
+                                    printf("S%d", idx);
+                                    if (idx < code->nstrings)
+                                        printf(" \"%s\"", code->strings[idx]);
+                                    break;
+                                default:
+                                    printf("[%d]", idx);
+                                    break;
+                            }
+                        } else {
+                            printf("[%d]", idx);
+                        }
+                        printf("\n");
+                    }
+                }
+            }
         }
     }
 
@@ -322,7 +722,7 @@ int main(int argc, char **argv) {
                 printf("  Library: %s\n", n->lib);
                 printf("  Name: %s\n", n->name);
                 printf("  Type: ");
-                print_type(n->t);
+                print_type_with_index(code, n->t);
                 printf("\n");
                 found = 1;
                 break;
