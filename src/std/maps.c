@@ -204,8 +204,216 @@ typedef struct {
 #define _MKEY(m,c)	m->values[c].key
 #define	_MSET(c)	m->entries[c].hash = hash; m->values[c].key = key
 #define _MERASE(c)  m->values[c].key = NULL
+#define _MNO_EXPORTS
 
 #include "maps.h"
+
+#undef _MNO_EXPORTS
+
+// ----- BYTES MAP PRESIZING ---------------------------------
+
+#ifdef HL_MAP_PROFILE
+// Track first keys for maps that might grow large
+#define HL_MAP_PROFILE_SLOTS 64
+static struct {
+	hl_hb_map *map;
+	char first_key[128];
+} hl_hb_profile_slots[HL_MAP_PROFILE_SLOTS];
+static int hl_hb_profile_slot_idx = 0;
+
+static void hl_hb_profile_record_first_key(hl_hb_map *m, uchar *key) {
+	int slot = hl_hb_profile_slot_idx++ % HL_MAP_PROFILE_SLOTS;
+	hl_hb_profile_slots[slot].map = m;
+	// Convert uchar* to char* for storage
+	int j = 0;
+	for(int i = 0; key[i] && j < 127; i++) {
+		if(key[i] < 128) hl_hb_profile_slots[slot].first_key[j++] = (char)key[i];
+	}
+	hl_hb_profile_slots[slot].first_key[j] = 0;
+}
+
+static const char* hl_hb_profile_get_first_key(hl_hb_map *m) {
+	for(int i = 0; i < HL_MAP_PROFILE_SLOTS; i++) {
+		if(hl_hb_profile_slots[i].map == m)
+			return hl_hb_profile_slots[i].first_key;
+	}
+	return "(unknown)";
+}
+
+static void hl_hb_profile_large_map(hl_hb_map *m, int threshold) {
+	const char *first_key = hl_hb_profile_get_first_key(m);
+	fprintf(stderr, "HL_MAP_PROFILE: threshold=%d maxentries=%d first_key=\"%s\"\n",
+		threshold, m->maxentries, first_key);
+}
+#endif
+
+// Lookup table for pre-sizing bytes maps based on first key prefix
+// Populated from profiling data - add entries discovered via HL_MAP_PROFILE
+static struct { const char *prefix; int target_size; } hl_hb_presets[] = {
+	// Atlas animation maps (reach 8000+ entries)
+	{"activationLevier_", 10949},
+	{"drink_", 10949},
+	// Animation/asset maps (reach 4000-5000 entries)
+	{"anims", 5471},
+	// Localization strings (reach 4000+ entries)
+	{"Abandonner", 5471},
+	// Lab/level data (reach 2000+ entries)
+	{"LabSeb", 2729},
+	// FX animation maps (reach 2000+ entries)
+	{"comboKickA/", 2729},
+	{"fxSpikeBootsA/", 2729},
+	{"fxGolemPunch/", 1361},
+	{"basherAtkFx/", 1361},
+	// UI/texture maps (reach 1000+ entries)
+	{"ui/", 1361},
+	{"64x64/", 1361},
+	{"DLCPurple/", 1361},
+	{"achemyPentagram", 1361},
+	{"affectBerserker", 1361},
+	{"fxDiamondRed", 710},
+	{NULL, 0}
+};
+
+static void hl_hb_presize_direct(hl_hb_map *m, int target_entries) {
+	// Directly allocate map to target size (single allocation)
+	int i = 0;
+	int ncells = target_entries >> 2;
+	while(H_PRIMES[i] < ncells) i++;
+	ncells = H_PRIMES[i];
+
+	int ksize = target_entries < _MLIMIT ? 1 : sizeof(int);
+	m->entries = (hl_hb_entry*)hl_gc_alloc_noptr(target_entries * sizeof(hl_hb_entry));
+	m->values = (hl_hb_value*)hl_gc_alloc_raw(target_entries * sizeof(hl_hb_value));
+	m->cells = hl_gc_alloc_noptr((ncells + target_entries) * ksize);
+	m->nexts = (char*)m->cells + ncells * ksize;
+	m->ncells = ncells;
+	m->maxentries = target_entries;
+	memset(m->cells, 0xFF, ncells * ksize);
+	memset(m->values, 0, target_entries * sizeof(hl_hb_value));
+	hl_freelist_init(&m->lfree);
+	hl_freelist_add_range(&m->lfree, 0, target_entries);
+}
+
+static void hl_hb_presize_check(hl_hb_map *m, uchar *key) {
+	// Check if key matches any preset prefix
+	for(int i = 0; hl_hb_presets[i].prefix; i++) {
+		const char *prefix = hl_hb_presets[i].prefix;
+		int match = 1;
+		for(int j = 0; prefix[j]; j++) {
+			if(key[j] != (uchar)prefix[j]) {
+				match = 0;
+				break;
+			}
+		}
+		if(match) {
+			hl_hb_presize_direct(m, hl_hb_presets[i].target_size);
+			return;
+		}
+	}
+}
+
+// Custom bytes map functions with pre-sizing support
+
+HL_PRIM void hl_hbset( hl_hb_map *m, uchar *key, vdynamic *value ) {
+	key = hl_hbfilter(key);
+	// Check for pre-sizing on first insert
+	if(m->nentries == 0) {
+#ifdef HL_MAP_PROFILE
+		hl_hb_profile_record_first_key(m, key);
+#endif
+		hl_hb_presize_check(m, key);
+	}
+	hl_hbset_impl(m, key, value);
+#ifdef HL_MAP_PROFILE
+	// Profile maps crossing thresholds
+	static const int thresholds[] = {100, 500, 1000, 2000, 4000, 8000, 0};
+	for(int i = 0; thresholds[i]; i++) {
+		if(m->nentries == thresholds[i]) {
+			hl_hb_profile_large_map(m, thresholds[i]);
+			break;
+		}
+	}
+#endif
+}
+
+HL_PRIM bool hl_hbexists( hl_hb_map *m, uchar *key ) {
+	return hl_hbfind(m, hl_hbfilter(key)) != NULL;
+}
+
+HL_PRIM vdynamic* hl_hbget( hl_hb_map *m, uchar *key ) {
+	vdynamic **v = hl_hbfind(m, hl_hbfilter(key));
+	if( v == NULL ) return NULL;
+	return *v;
+}
+
+HL_PRIM bool hl_hbremove( hl_hb_map *m, uchar *key ) {
+	int c, prev = -1, ckey;
+	unsigned int hash;
+	if( !m->cells ) return false;
+	key = hl_hbfilter(key);
+	hash = hl_hbhash(key);
+	ckey = hash % ((unsigned)m->ncells);
+	c = m->maxentries < _MLIMIT ? (int)((signed char*)m->cells)[ckey] : ((int*)m->cells)[ckey];
+	while( c >= 0 ) {
+		if( m->entries[c].hash == hash && ucmp(m->values[c].key,key) == 0 ) {
+			hl_freelist_add(&m->lfree,c);
+			m->nentries--;
+			m->values[c].key = NULL;
+			m->values[c].value = NULL;
+			if( m->maxentries < _MLIMIT ) {
+				if( prev >= 0 )
+					((signed char*)m->nexts)[prev] = ((signed char*)m->nexts)[c];
+				else
+					((signed char*)m->cells)[ckey] = ((signed char*)m->nexts)[c];
+			} else {
+				if( prev >= 0 )
+					((int*)m->nexts)[prev] = ((int*)m->nexts)[c];
+				else
+					((int*)m->cells)[ckey] = ((int*)m->nexts)[c];
+			}
+			return true;
+		}
+		prev = c;
+		c = m->maxentries < _MLIMIT ? (int)((signed char*)m->nexts)[c] : ((int*)m->nexts)[c];
+	}
+	return false;
+}
+
+HL_PRIM varray* hl_hbkeys( hl_hb_map *m ) {
+	varray *a = hl_alloc_array(&hlt_bytes,m->nentries);
+	uchar **keys = hl_aptr(a,uchar*);
+	int p = 0;
+	for(int i = 0; i < m->ncells; i++) {
+		int c = m->maxentries < _MLIMIT ? (int)((signed char*)m->cells)[i] : ((int*)m->cells)[i];
+		while( c >= 0 ) {
+			keys[p++] = m->values[c].key;
+			c = m->maxentries < _MLIMIT ? (int)((signed char*)m->nexts)[c] : ((int*)m->nexts)[c];
+		}
+	}
+	return a;
+}
+
+HL_PRIM varray* hl_hbvalues( hl_hb_map *m ) {
+	varray *a = hl_alloc_array(&hlt_dyn,m->nentries);
+	vdynamic **values = hl_aptr(a,vdynamic*);
+	int p = 0;
+	for(int i = 0; i < m->ncells; i++) {
+		int c = m->maxentries < _MLIMIT ? (int)((signed char*)m->cells)[i] : ((int*)m->cells)[i];
+		while( c >= 0 ) {
+			values[p++] = m->values[c].value;
+			c = m->maxentries < _MLIMIT ? (int)((signed char*)m->nexts)[c] : ((int*)m->nexts)[c];
+		}
+	}
+	return a;
+}
+
+HL_PRIM void hl_hbclear( hl_hb_map *m ) {
+	memset(m,0,sizeof(hl_hb_map));
+}
+
+HL_PRIM int hl_hbsize( hl_hb_map *m ) {
+	return m->nentries;
+}
 
 // ----- OBJECT MAP ---------------------------------
 
