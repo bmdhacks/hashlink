@@ -369,10 +369,16 @@ struct _fmt_ogg {
 	int pos;
 	int size;
 	int section;
+	int is_open;
+	int cached_samples;
+	int cached_channels;
+	int cached_rate;
+	int cached_bitrate;
 };
 
 static void ogg_finalize( fmt_ogg *o ) {
-	ov_clear(&o->f);
+	if (o->is_open)
+		ov_clear(&o->f);
 }
 
 static size_t ogg_memread( void *ptr, int size, int count, fmt_ogg *o ) {
@@ -414,31 +420,51 @@ static ov_callbacks OV_CALLBACKS_MEMORY = {
   (long (*)(void *))                            ogg_memtell
 };
 
+static int ogg_ensure_open(fmt_ogg *o) {
+	if (o->is_open) return 0;
+	o->pos = 0;
+	if (ov_open_callbacks(o, &o->f, NULL, 0, OV_CALLBACKS_MEMORY) != 0)
+		return -1;
+	o->is_open = 1;
+	return 0;
+}
+
 HL_PRIM fmt_ogg *HL_NAME(ogg_open)( char *bytes, int size ) {
 	fmt_ogg *o = (fmt_ogg*)hl_gc_alloc_finalizer(sizeof(fmt_ogg));
+	vorbis_info *i;
 	o->finalize = NULL;
 	o->bytes = bytes;
 	o->size = size;
 	o->pos = 0;
+	o->is_open = 0;
 	if( ov_open_callbacks(o,&o->f,NULL,0,OV_CALLBACKS_MEMORY) != 0 )
 		return NULL;
+	i = ov_info(&o->f, -1);
+	o->cached_bitrate = i->bitrate_nominal;
+	o->cached_rate = i->rate;
+	o->cached_channels = i->channels;
+	o->cached_samples = (int)ov_pcm_total(&o->f, -1);
+	ov_clear(&o->f);
+	o->pos = 0;
 	o->finalize = ogg_finalize;
 	return o;
 }
 
 HL_PRIM void HL_NAME(ogg_info)( fmt_ogg *o, int *bitrate, int *freq, int *samples, int *channels ) {
-	vorbis_info *i = ov_info(&o->f,-1);
-	*bitrate = i->bitrate_nominal;
-	*freq = i->rate;
-	*channels = i->channels;
-	*samples = (int)ov_pcm_total(&o->f, -1);
+	*bitrate = o->cached_bitrate;
+	*freq = o->cached_rate;
+	*channels = o->cached_channels;
+	*samples = o->cached_samples;
 }
 
 HL_PRIM int HL_NAME(ogg_tell)( fmt_ogg *o ) {
+	if (!o->is_open) return 0;
 	return (int)ov_pcm_tell(&o->f); // overflow at 12 hours @48 Khz
 }
 
 HL_PRIM bool HL_NAME(ogg_seek)( fmt_ogg *o, int sample ) {
+	if (ogg_ensure_open(o) != 0)
+		return false;
 	return ov_pcm_seek(&o->f,sample) == 0;
 }
 
@@ -450,6 +476,8 @@ HL_PRIM bool HL_NAME(ogg_seek)( fmt_ogg *o, int sample ) {
 
 HL_PRIM int HL_NAME(ogg_read)( fmt_ogg *o, char *output, int size, int format ) {
 	int ret = -1;
+	if (ogg_ensure_open(o) != 0)
+		return -1;
 	hl_blocking(true);
 	switch( format&127 ) {
 	case OGGFMT_I8:
