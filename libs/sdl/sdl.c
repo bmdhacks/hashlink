@@ -5,6 +5,9 @@
 
 #include <locale.h>
 #include <SDL.h>
+#ifndef HL_WIN
+#include <time.h>
+#endif
 
 #if defined(HL_WIN) || defined(HL_IOS) || defined(HL_TVOS)
 #	include <SDL_syswm.h>
@@ -98,6 +101,39 @@ typedef struct {
 	int window;
 	vbyte* dropFile;
 } event_data;
+
+// FPS counter (enabled via HL_PRINT_FPS=1)
+#ifndef HL_WIN
+static int fps_enabled = -1; // -1 = not checked
+static int fps_frame_count = 0;
+static double fps_last_time = 0.0;
+
+static void fps_update(void) {
+	if (fps_enabled < 0) {
+		const char* env = getenv("HL_PRINT_FPS");
+		fps_enabled = (env && env[0] == '1');
+	}
+	if (!fps_enabled) return;
+
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	double current_time = ts.tv_sec + ts.tv_nsec / 1e9;
+
+	fps_frame_count++;
+
+	if (fps_last_time == 0.0) {
+		fps_last_time = current_time;
+		fps_frame_count = 0;
+	} else if (current_time - fps_last_time >= 1.0) {
+		double fps = fps_frame_count / (current_time - fps_last_time);
+		printf("[HL] FPS: %.2f\n", fps);
+		fps_frame_count = 0;
+		fps_last_time = current_time;
+	}
+}
+#else
+static void fps_update(void) {}
+#endif
 
 static bool isGlOptionsSet = false;
 
@@ -713,6 +749,7 @@ HL_PRIM void HL_NAME(win_swap_window)(SDL_Window *win) {
 	glBindRenderbuffer(GL_RENDERBUFFER,info.info.uikit.colorbuffer);
 #endif
 	SDL_GL_SwapWindow(win);
+	fps_update();
 }
 
 HL_PRIM void HL_NAME(win_render_to)(SDL_Window *win, SDL_GLContext gl) {
