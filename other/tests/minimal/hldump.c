@@ -229,6 +229,44 @@ static int find_type_index(hl_code *c, hl_type *t) {
     return -1;
 }
 
+/* Count total fields including inherited ones */
+static int count_total_fields(hl_type *t) {
+    if (!t || (t->kind != HOBJ && t->kind != HSTRUCT) || !t->obj)
+        return 0;
+    int count = t->obj->nfields;
+    if (t->obj->super)
+        count += count_total_fields(t->obj->super);
+    return count;
+}
+
+/* Find field by runtime index (accounting for inheritance)
+ * Returns the field info and sets *defining_type to the type that defines the field */
+static hl_obj_field *find_field_by_runtime_index(hl_type *t, int runtime_idx, hl_type **defining_type) {
+    if (!t || (t->kind != HOBJ && t->kind != HSTRUCT) || !t->obj) {
+        if (defining_type) *defining_type = NULL;
+        return NULL;
+    }
+
+    /* First count inherited fields */
+    int inherited = 0;
+    if (t->obj->super)
+        inherited = count_total_fields(t->obj->super);
+
+    if (runtime_idx < inherited) {
+        /* Field is in a parent class */
+        return find_field_by_runtime_index(t->obj->super, runtime_idx, defining_type);
+    } else {
+        /* Field is in this class */
+        int local_idx = runtime_idx - inherited;
+        if (local_idx < t->obj->nfields) {
+            if (defining_type) *defining_type = t;
+            return &t->obj->fields[local_idx];
+        }
+        if (defining_type) *defining_type = NULL;
+        return NULL;
+    }
+}
+
 /* Print type with T index prefix */
 static void print_type_with_index(hl_code *c, hl_type *t) {
     int idx = find_type_index(c, t);
@@ -344,13 +382,77 @@ static void dump_function(hl_code *c, hl_function *f, int verbose) {
 
         /* Show extra info for some opcodes */
         switch (op->op) {
+            case OMov:
+                printf("  ; r%d = r%d", op->p1, op->p2);
+                break;
+            case ONull:
+                printf("  ; r%d = null", op->p1);
+                break;
+            case OAdd:
+                printf("  ; r%d = r%d + r%d", op->p1, op->p2, op->p3);
+                break;
+            case OSub:
+                printf("  ; r%d = r%d - r%d", op->p1, op->p2, op->p3);
+                break;
+            case OMul:
+                printf("  ; r%d = r%d * r%d", op->p1, op->p2, op->p3);
+                break;
+            case OSDiv:
+                printf("  ; r%d = r%d / r%d (signed)", op->p1, op->p2, op->p3);
+                break;
+            case OUDiv:
+                printf("  ; r%d = r%d / r%d (unsigned)", op->p1, op->p2, op->p3);
+                break;
+            case OSMod:
+                printf("  ; r%d = r%d %% r%d (signed)", op->p1, op->p2, op->p3);
+                break;
+            case OUMod:
+                printf("  ; r%d = r%d %% r%d (unsigned)", op->p1, op->p2, op->p3);
+                break;
+            case ONeg:
+                printf("  ; r%d = -r%d", op->p1, op->p2);
+                break;
+            case ONot:
+                printf("  ; r%d = !r%d", op->p1, op->p2);
+                break;
+            case OIncr:
+                printf("  ; r%d++", op->p1);
+                break;
+            case ODecr:
+                printf("  ; r%d--", op->p1);
+                break;
+            case OShl:
+                printf("  ; r%d = r%d << r%d", op->p1, op->p2, op->p3);
+                break;
+            case OSShr:
+                printf("  ; r%d = r%d >> r%d (signed)", op->p1, op->p2, op->p3);
+                break;
+            case OUShr:
+                printf("  ; r%d = r%d >>> r%d (unsigned)", op->p1, op->p2, op->p3);
+                break;
+            case OAnd:
+                printf("  ; r%d = r%d & r%d", op->p1, op->p2, op->p3);
+                break;
+            case OOr:
+                printf("  ; r%d = r%d | r%d", op->p1, op->p2, op->p3);
+                break;
+            case OXor:
+                printf("  ; r%d = r%d ^ r%d", op->p1, op->p2, op->p3);
+                break;
+            case OLabel:
+                printf("  ; label");
+                break;
             case OInt:
                 if (op->p2 >= 0 && op->p2 < c->nints)
-                    printf("  ; r%d = %d", op->p1, c->ints[op->p2]);
+                    printf("  ; r%d = I%d (%d)", op->p1, op->p2, c->ints[op->p2]);
+                else
+                    printf("  ; r%d = I%d", op->p1, op->p2);
                 break;
             case OString:
                 if (op->p2 >= 0 && op->p2 < c->nstrings)
-                    printf("  ; r%d = \"%s\"", op->p1, c->strings[op->p2]);
+                    printf("  ; r%d = S%d \"%s\"", op->p1, op->p2, c->strings[op->p2]);
+                else
+                    printf("  ; r%d = S%d", op->p1, op->p2);
                 break;
             case OBool:
                 printf("  ; r%d = %s", op->p1, op->p2 ? "true" : "false");
@@ -421,19 +523,222 @@ static void dump_function(hl_code *c, hl_function *f, int verbose) {
                 printf("  ; return r%d", op->p1);
                 break;
             case OGetGlobal:
-                printf("  ; r%d = global[%d]", op->p1, op->p2);
+                printf("  ; r%d = G%d", op->p1, op->p2);
                 break;
             case OSetGlobal:
-                printf("  ; global[%d] = r%d", op->p2, op->p1);
+                printf("  ; G%d = r%d", op->p2, op->p1);
                 break;
             case OField:
-                printf("  ; r%d = r%d.field[%d]", op->p1, op->p2, op->p3);
+                {
+                    hl_type *ot = f->regs[op->p2];
+                    int tidx = find_type_index(c, ot);
+                    printf("  ; r%d = r%d T%d .F%d", op->p1, op->p2, tidx, op->p3);
+                    /* Try to show field name (accounting for inheritance) */
+                    if (ot && (ot->kind == HOBJ || ot->kind == HSTRUCT) && ot->obj) {
+                        hl_type *def_type = NULL;
+                        hl_obj_field *fld = find_field_by_runtime_index(ot, op->p3, &def_type);
+                        if (fld) {
+                            printf(" ");
+                            print_ustr(fld->name);
+                            if (def_type && def_type != ot && def_type->obj && def_type->obj->name) {
+                                printf(" (from ");
+                                print_ustr(def_type->obj->name);
+                                printf(")");
+                            }
+                        }
+                    } else if (ot && ot->kind == HVIRTUAL && ot->virt && op->p3 < ot->virt->nfields) {
+                        printf(" ");
+                        print_ustr(ot->virt->fields[op->p3].name);
+                    }
+                }
                 break;
             case OSetField:
-                printf("  ; r%d.field[%d] = r%d", op->p1, op->p2, op->p3);
+                {
+                    hl_type *ot = f->regs[op->p1];
+                    int tidx = find_type_index(c, ot);
+                    printf("  ; r%d T%d .F%d", op->p1, tidx, op->p2);
+                    /* Try to show field name (accounting for inheritance) */
+                    if (ot && (ot->kind == HOBJ || ot->kind == HSTRUCT) && ot->obj) {
+                        hl_type *def_type = NULL;
+                        hl_obj_field *fld = find_field_by_runtime_index(ot, op->p2, &def_type);
+                        if (fld) {
+                            printf(" ");
+                            print_ustr(fld->name);
+                            if (def_type && def_type != ot && def_type->obj && def_type->obj->name) {
+                                printf(" (from ");
+                                print_ustr(def_type->obj->name);
+                                printf(")");
+                            }
+                        }
+                    } else if (ot && ot->kind == HVIRTUAL && ot->virt && op->p2 < ot->virt->nfields) {
+                        printf(" ");
+                        print_ustr(ot->virt->fields[op->p2].name);
+                    }
+                    printf(" = r%d", op->p3);
+                }
+                break;
+            case OGetThis:
+                /* p1=dst, p2=field_idx - gets field from r0 (this) */
+                {
+                    hl_type *ot = f->regs[0];
+                    int tidx = find_type_index(c, ot);
+                    printf("  ; r%d = r0 T%d .F%d", op->p1, tidx, op->p2);
+                    if (ot && (ot->kind == HOBJ || ot->kind == HSTRUCT) && ot->obj) {
+                        hl_type *def_type = NULL;
+                        hl_obj_field *fld = find_field_by_runtime_index(ot, op->p2, &def_type);
+                        if (fld) {
+                            printf(" ");
+                            print_ustr(fld->name);
+                            if (def_type && def_type != ot && def_type->obj && def_type->obj->name) {
+                                printf(" (from ");
+                                print_ustr(def_type->obj->name);
+                                printf(")");
+                            }
+                        }
+                    }
+                }
+                break;
+            case OSetThis:
+                /* p1=field_idx, p2=value_reg - sets field on r0 (this) */
+                {
+                    hl_type *ot = f->regs[0];
+                    int tidx = find_type_index(c, ot);
+                    printf("  ; r0 T%d .F%d", tidx, op->p1);
+                    if (ot && (ot->kind == HOBJ || ot->kind == HSTRUCT) && ot->obj) {
+                        hl_type *def_type = NULL;
+                        hl_obj_field *fld = find_field_by_runtime_index(ot, op->p1, &def_type);
+                        if (fld) {
+                            printf(" ");
+                            print_ustr(fld->name);
+                            if (def_type && def_type != ot && def_type->obj && def_type->obj->name) {
+                                printf(" (from ");
+                                print_ustr(def_type->obj->name);
+                                printf(")");
+                            }
+                        }
+                    }
+                    printf(" = r%d", op->p2);
+                }
                 break;
             case ONew:
-                printf("  ; r%d = new", op->p1);
+                {
+                    hl_type *t = f->regs[op->p1];
+                    int tidx = find_type_index(c, t);
+                    printf("  ; r%d = new T%d ", op->p1, tidx);
+                    print_type(t);
+                }
+                break;
+            case OType:
+                /* p1=dst, p2=type_index */
+                {
+                    hl_type *t = (op->p2 >= 0 && op->p2 < c->ntypes) ? &c->types[op->p2] : NULL;
+                    printf("  ; r%d = T%d ", op->p1, op->p2);
+                    if (t) print_type(t);
+                }
+                break;
+            case OGetType:
+                /* p1=dst, p2=src_reg - gets type from object */
+                {
+                    hl_type *src_t = f->regs[op->p2];
+                    int tidx = find_type_index(c, src_t);
+                    printf("  ; r%d = typeof(r%d) T%d ", op->p1, op->p2, tidx);
+                    print_type(src_t);
+                }
+                break;
+            case OGetTID:
+                /* p1=dst, p2=src_reg - gets type ID */
+                printf("  ; r%d = typeid(r%d)", op->p1, op->p2);
+                break;
+            case ORef:
+                /* p1=dst, p2=src - create reference */
+                {
+                    hl_type *dst_t = f->regs[op->p1];
+                    int tidx = find_type_index(c, dst_t);
+                    printf("  ; r%d = &r%d T%d ", op->p1, op->p2, tidx);
+                    print_type(dst_t);
+                }
+                break;
+            case OUnref:
+                /* p1=dst, p2=ref - dereference */
+                {
+                    hl_type *dst_t = f->regs[op->p1];
+                    int tidx = find_type_index(c, dst_t);
+                    printf("  ; r%d = *r%d T%d ", op->p1, op->p2, tidx);
+                    print_type(dst_t);
+                }
+                break;
+            case OSetref:
+                /* p1=ref, p2=value */
+                printf("  ; *r%d = r%d", op->p1, op->p2);
+                break;
+            case OGetArray:
+                /* p1=dst, p2=array, p3=index */
+                printf("  ; r%d = r%d[r%d]", op->p1, op->p2, op->p3);
+                break;
+            case OSetArray:
+                /* p1=array, p2=index, p3=value */
+                printf("  ; r%d[r%d] = r%d", op->p1, op->p2, op->p3);
+                break;
+            case OArraySize:
+                /* p1=dst, p2=array */
+                printf("  ; r%d = r%d.length", op->p1, op->p2);
+                break;
+            case OSwitch:
+                /* p1=value, p2=ncases, p3=end_offset, extra=case_offsets */
+                printf("  ; switch r%d [", op->p1);
+                for (int j = 0; j < op->p2 && j < 8; j++) {
+                    printf("%d:%d", j, (i + 1) + op->extra[j]);
+                    if (j < op->p2 - 1) printf(", ");
+                }
+                if (op->p2 > 8) printf(", ...");
+                printf("] default:%d", (i + 1) + op->p3);
+                break;
+            case ONullCheck:
+                printf("  ; nullcheck r%d", op->p1);
+                break;
+            case OThrow:
+                printf("  ; throw r%d", op->p1);
+                break;
+            case ORethrow:
+                printf("  ; rethrow r%d", op->p1);
+                break;
+            case OTrap:
+                /* p1=dst (exception reg), p2=offset to end of try block */
+                printf("  ; try { -> catch at %d }", (i + 1) + op->p2);
+                break;
+            case OEndTrap:
+                /* p1=1 if trap was triggered */
+                printf("  ; } endtrap (triggered=%d)", op->p1);
+                break;
+            case OCatch:
+                /* p1=global_idx for typing (doesn't do anything at runtime) */
+                printf("  ; catch (G%d for type)", op->p1);
+                break;
+            case OToDyn:
+            case OToVirtual:
+            case OSafeCast:
+            case OUnsafeCast:
+                /* p1=dst, p2=src */
+                {
+                    hl_type *dst_t = f->regs[op->p1];
+                    int tidx = find_type_index(c, dst_t);
+                    printf("  ; r%d = (T%d ", op->p1, tidx);
+                    print_type(dst_t);
+                    printf(") r%d", op->p2);
+                }
+                break;
+            case ODynGet:
+                /* p1=dst, p2=obj, p3=string_idx (field name) */
+                printf("  ; r%d = r%d.S%d", op->p1, op->p2, op->p3);
+                if (op->p3 >= 0 && op->p3 < c->nstrings)
+                    printf(" \"%s\"", c->strings[op->p3]);
+                break;
+            case ODynSet:
+                /* p1=obj, p2=string_idx (field name), p3=value */
+                printf("  ; r%d.S%d", op->p1, op->p2);
+                if (op->p2 >= 0 && op->p2 < c->nstrings)
+                    printf(" \"%s\"", c->strings[op->p2]);
+                printf(" = r%d", op->p3);
                 break;
             case OStaticClosure:
                 /* p1=dst, p2=findex */
@@ -453,18 +758,21 @@ static void dump_function(hl_code *c, hl_function *f, int verbose) {
                 break;
             case OFloat:
                 if (op->p2 >= 0 && op->p2 < c->nfloats)
-                    printf("  ; r%d = %g", op->p1, c->floats[op->p2]);
+                    printf("  ; r%d = FL%d (%g)", op->p1, op->p2, c->floats[op->p2]);
+                else
+                    printf("  ; r%d = FL%d", op->p1, op->p2);
                 break;
             case OBytes:
-                printf("  ; r%d = bytes[%d]", op->p1, op->p2);
+                printf("  ; r%d = B%d", op->p1, op->p2);
                 break;
             case OMakeEnum:
                 /* p1=dst, p2=construct_idx, p3=nargs */
                 {
                     hl_type *et = f->regs[op->p1];
+                    int tidx = find_type_index(c, et);
+                    printf("  ; r%d = T%d ", op->p1, tidx);
                     if (et && et->kind == HENUM && et->tenum && op->p2 < et->tenum->nconstructs) {
                         hl_enum_construct *ec = &et->tenum->constructs[op->p2];
-                        printf("  ; ");
                         print_ustr(et->tenum->name);
                         printf("::");
                         print_ustr(ec->name);
@@ -473,12 +781,18 @@ static void dump_function(hl_code *c, hl_function *f, int verbose) {
                 }
                 break;
             case OEnumAlloc:
-                /* p1=dst, p2=type_idx */
+                /* p1=dst, p2=construct_idx */
                 {
                     hl_type *et = f->regs[op->p1];
+                    int tidx = find_type_index(c, et);
+                    printf("  ; r%d = alloc T%d ", op->p1, tidx);
                     if (et && et->kind == HENUM && et->tenum) {
-                        printf("  ; alloc ");
                         print_ustr(et->tenum->name);
+                        if (op->p2 < et->tenum->nconstructs) {
+                            printf("::");
+                            print_ustr(et->tenum->constructs[op->p2].name);
+                            printf("[C%d]", op->p2);
+                        }
                     }
                 }
                 break;
@@ -489,21 +803,26 @@ static void dump_function(hl_code *c, hl_function *f, int verbose) {
                 /* p1=dst, p2=enum_reg, p3=construct_idx, extra=field_idx */
                 {
                     hl_type *et = f->regs[op->p2];
+                    int tidx = find_type_index(c, et);
                     int construct_idx = op->p3;
                     int field_idx = (int)(int_val)op->extra;
+                    printf("  ; r%d = r%d T%d ", op->p1, op->p2, tidx);
                     if (et && et->kind == HENUM && et->tenum && construct_idx < et->tenum->nconstructs) {
                         hl_enum_construct *ec = &et->tenum->constructs[construct_idx];
-                        printf("  ; ");
                         print_ustr(et->tenum->name);
                         printf("::");
                         print_ustr(ec->name);
-                        printf("[C%d].field[P%d]", construct_idx, field_idx);
+                        printf("[C%d].P%d", construct_idx, field_idx);
                     }
                 }
                 break;
             case OSetEnumField:
                 /* p1=enum_reg, p2=field_idx, p3=value_reg - always construct 0 */
-                printf("  ; r%d[C0].field[P%d] = r%d", op->p1, op->p2, op->p3);
+                {
+                    hl_type *et = f->regs[op->p1];
+                    int tidx = find_type_index(c, et);
+                    printf("  ; r%d T%d [C0].P%d = r%d", op->p1, tidx, op->p2, op->p3);
+                }
                 break;
             default:
                 break;
