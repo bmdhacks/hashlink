@@ -102,8 +102,9 @@ typedef struct {
     /* Type constant pointers - no longer used, types accessed via aot_get_type */
     LLVMValueRef *type_constants;
 
-    /* AOT runtime accessors */
-    LLVMValueRef rt_aot_get_type;
+    /* AOT runtime accessors - inline globals for fast access */
+    LLVMValueRef aot_types_global;     /* External ptr: &aot_types (pointer to type array) */
+    LLVMValueRef rt_aot_get_type;      /* Fallback function (kept for compatibility) */
     LLVMValueRef rt_aot_get_global;
 
     /* Runtime function declarations */

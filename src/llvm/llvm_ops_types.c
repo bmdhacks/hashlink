@@ -338,6 +338,34 @@ void llvm_emit_types(llvm_ctx *ctx, hl_function *f, hl_opcode *op, int op_idx) {
         LLVMValueRef result;
 
         /*
+         * Compile-time optimization: same type, no cast needed
+         */
+        if (src_type == dst_type) {
+            result = llvm_load_vreg(ctx, f, src);
+            llvm_store_vreg(ctx, f, dst, result);
+            break;
+        }
+
+        /*
+         * Compile-time optimization: casting to HDYN from a dynamic type is identity
+         */
+        if (dst_type->kind == HDYN && hl_is_dynamic(src_type)) {
+            result = llvm_load_vreg(ctx, f, src);
+            llvm_store_vreg(ctx, f, dst, result);
+            break;
+        }
+
+        /*
+         * Compile-time optimization: use hl_safe_cast at compile time
+         * This handles compatible object hierarchies, virtual types, etc.
+         */
+        if (hl_safe_cast(src_type, dst_type)) {
+            result = llvm_load_vreg(ctx, f, src);
+            llvm_store_vreg(ctx, f, dst, result);
+            break;
+        }
+
+        /*
          * Special case: Null<T> -> T unboxing
          * The JIT handles this inline instead of calling runtime functions.
          * Use the llvm_unbox_null helper which handles primitive types.
@@ -351,6 +379,61 @@ void llvm_emit_types(llvm_ctx *ctx, hl_function *f, hl_opcode *op, int op_idx) {
                 break;
             }
             /* Fall through to runtime for unsupported types */
+        }
+
+        /*
+         * Inline fast path for HDYN -> pointer type casts.
+         * The common case is when runtime type exactly matches destination type.
+         * We inline: null check, type equality check, then fall back to runtime.
+         *
+         * This avoids the function call overhead for the most common case.
+         */
+        if (src_type->kind == HDYN && llvm_is_ptr_type(dst_type)) {
+            LLVMValueRef val = llvm_load_vreg(ctx, f, src);
+
+            /* Create basic blocks */
+            LLVMBasicBlockRef null_bb = LLVMAppendBasicBlock(ctx->current_function, "dyn_null");
+            LLVMBasicBlockRef check_type_bb = LLVMAppendBasicBlock(ctx->current_function, "dyn_check_type");
+            LLVMBasicBlockRef fast_bb = LLVMAppendBasicBlock(ctx->current_function, "dyn_fast");
+            LLVMBasicBlockRef slow_bb = LLVMAppendBasicBlock(ctx->current_function, "dyn_slow");
+            LLVMBasicBlockRef merge_bb = LLVMAppendBasicBlock(ctx->current_function, "dyn_merge");
+
+            /* Null check: if val == null, go to null path */
+            LLVMValueRef is_null = LLVMBuildICmp(ctx->builder, LLVMIntEQ, val,
+                LLVMConstNull(ctx->ptr_type), "is_null");
+            LLVMBuildCondBr(ctx->builder, is_null, null_bb, check_type_bb);
+
+            /* Null path: return null */
+            LLVMPositionBuilderAtEnd(ctx->builder, null_bb);
+            LLVMBuildBr(ctx->builder, merge_bb);
+
+            /* Check type: load v->t (at offset 0) and compare with dst_type */
+            LLVMPositionBuilderAtEnd(ctx->builder, check_type_bb);
+            LLVMValueRef runtime_type = LLVMBuildLoad2(ctx->builder, ctx->ptr_type, val, "runtime_type");
+            LLVMValueRef types_match = LLVMBuildICmp(ctx->builder, LLVMIntEQ,
+                runtime_type, dst_type_ptr, "types_match");
+            LLVMBuildCondBr(ctx->builder, types_match, fast_bb, slow_bb);
+
+            /* Fast path: types match exactly, return the value */
+            LLVMPositionBuilderAtEnd(ctx->builder, fast_bb);
+            LLVMBuildBr(ctx->builder, merge_bb);
+
+            /* Slow path: call hl_dyn_castp for hierarchy checks, etc */
+            LLVMPositionBuilderAtEnd(ctx->builder, slow_bb);
+            LLVMValueRef slow_result = LLVMBuildCall2(ctx->builder,
+                LLVMGlobalGetValueType(ctx->rt_dyn_castp),
+                ctx->rt_dyn_castp, (LLVMValueRef[]){ src_addr, src_type_ptr, dst_type_ptr }, 3, "");
+            LLVMBuildBr(ctx->builder, merge_bb);
+
+            /* Merge with phi */
+            LLVMPositionBuilderAtEnd(ctx->builder, merge_bb);
+            result = LLVMBuildPhi(ctx->builder, ctx->ptr_type, "cast_result");
+            LLVMAddIncoming(result,
+                (LLVMValueRef[]){ LLVMConstNull(ctx->ptr_type), val, slow_result },
+                (LLVMBasicBlockRef[]){ null_bb, fast_bb, slow_bb }, 3);
+
+            llvm_store_vreg(ctx, f, dst, result);
+            break;
         }
 
         /* Runtime cast path - use appropriate hl_dyn_cast* function */

@@ -221,7 +221,7 @@ HL_PRIM bool hl_safe_cast( hl_type *t, hl_type *to ) {
 	if( t == to )
 		return true;
 	if( to->kind == HDYN )
-		return hl_is_dynamic(t);
+		return hl_is_dynamic_fast(t);
 	if( t->kind != to->kind )
 		return false;
 	switch( t->kind ) {
@@ -258,7 +258,7 @@ HL_PRIM bool hl_safe_cast( hl_type *t, hl_type *to ) {
 			for(i=0;i<t->fun->nargs;i++) {
 				hl_type *t1 = t->fun->args[i];
 				hl_type *t2 = to->fun->args[i];
-				if( !hl_safe_cast(t2,t1) && (t1->kind != HDYN || !hl_is_dynamic(t2)) )
+				if( !hl_safe_cast(t2,t1) && (t1->kind != HDYN || !hl_is_dynamic_fast(t2)) )
 					return false;
 			}
 			return true;
@@ -763,7 +763,7 @@ static void compact_write_ref( mem_context *ctx, void *ptr, bool is_bytes ) {
 }
 
 static void compact_write_data( mem_context *ctx, hl_type *t, void *addr ) {
-	if( hl_is_dynamic(t) ) {
+	if( hl_is_dynamic_fast(t) ) {
 		vdynamic *v = *(vdynamic**)addr;
 		if( v == NULL || (v->t->kind == HENUM && v->t->tenum->constructs[((venum*)v)->index].nparams == 0) ) {
 			compact_write_ptr(ctx,v);

@@ -1151,7 +1151,7 @@ HL_PRIM void hl_dyn_setp( vdynamic *d, int hfield, hl_type *t, void *value ) {
 	void *addr = hl_obj_lookup_set(d,hfield,t,&ft);
 	if( hl_same_type(t,ft) || (hl_is_ptr(ft) && value == NULL) )
 		*(void**)addr = value;
-	else if( hl_is_dynamic(t) )
+	else if( hl_is_dynamic_fast(t) )
 		hl_write_dyn(addr,ft,(vdynamic*)value,false);
 	else {
 		vdynamic tmp;

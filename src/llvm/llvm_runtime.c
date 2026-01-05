@@ -316,7 +316,13 @@ void llvm_declare_runtime(llvm_ctx *ctx) {
         }
     }
 
-    /* aot_get_type(int) -> void* - AOT runtime type accessor
+    /* aot_types global - direct access to type array for inlined type lookups.
+     * This is a pointer to the types array: hl_type *aot_types.
+     * Inlining the access eliminates function call overhead for type lookups. */
+    ctx->aot_types_global = LLVMAddGlobal(ctx->module, ptr, "aot_types");
+    LLVMSetLinkage(ctx->aot_types_global, LLVMExternalLinkage);
+
+    /* aot_get_type(int) -> void* - AOT runtime type accessor (kept as fallback)
      * Mark as pure function so LLVM can CSE and hoist out of loops.
      * The function just does: return &types_array[index]; */
     {

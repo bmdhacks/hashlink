@@ -859,14 +859,23 @@ LLVMValueRef llvm_get_function_ptr(llvm_ctx *ctx, int findex) {
 
 LLVMValueRef llvm_get_type_ptr(llvm_ctx *ctx, int type_idx) {
     /*
-     * Call aot_get_type(type_idx) to get the type pointer at runtime.
-     * This returns &aot_types[type_idx] where aot_types points to the
-     * module's types array (initialized by aot_init_module_data).
+     * Inline type pointer computation: &aot_types[type_idx]
+     * This eliminates function call overhead compared to aot_get_type().
+     *
+     * aot_types is a pointer to an array of hl_type structs.
+     * We load the base pointer and compute the element address directly.
      */
-    LLVMValueRef idx = LLVMConstInt(ctx->i32_type, type_idx, false);
-    LLVMValueRef args[] = { idx };
-    LLVMTypeRef fn_type = LLVMFunctionType(ctx->ptr_type, (LLVMTypeRef[]){ ctx->i32_type }, 1, false);
-    return LLVMBuildCall2(ctx->builder, fn_type, ctx->rt_aot_get_type, args, 1, "type_ptr");
+    /* Load the base pointer from @aot_types global */
+    LLVMValueRef types_base = LLVMBuildLoad2(ctx->builder, ctx->ptr_type,
+        ctx->aot_types_global, "types_base");
+
+    /* Compute byte offset: type_idx * sizeof(hl_type) */
+    LLVMValueRef byte_offset = LLVMConstInt(ctx->i64_type,
+        (uint64_t)type_idx * sizeof(hl_type), false);
+
+    /* GEP to compute &types_base[type_idx] using byte offset */
+    return LLVMBuildGEP2(ctx->builder, ctx->i8_type, types_base,
+        &byte_offset, 1, "type_ptr");
 }
 
 LLVMValueRef llvm_get_string(llvm_ctx *ctx, int str_idx) {

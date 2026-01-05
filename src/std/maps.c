@@ -212,43 +212,8 @@ typedef struct {
 
 // ----- BYTES MAP PRESIZING ---------------------------------
 
-#ifdef HL_MAP_PROFILE
-// Track first keys for maps that might grow large
-#define HL_MAP_PROFILE_SLOTS 64
-static struct {
-	hl_hb_map *map;
-	char first_key[128];
-} hl_hb_profile_slots[HL_MAP_PROFILE_SLOTS];
-static int hl_hb_profile_slot_idx = 0;
-
-static void hl_hb_profile_record_first_key(hl_hb_map *m, uchar *key) {
-	int slot = hl_hb_profile_slot_idx++ % HL_MAP_PROFILE_SLOTS;
-	hl_hb_profile_slots[slot].map = m;
-	// Convert uchar* to char* for storage
-	int j = 0;
-	for(int i = 0; key[i] && j < 127; i++) {
-		if(key[i] < 128) hl_hb_profile_slots[slot].first_key[j++] = (char)key[i];
-	}
-	hl_hb_profile_slots[slot].first_key[j] = 0;
-}
-
-static const char* hl_hb_profile_get_first_key(hl_hb_map *m) {
-	for(int i = 0; i < HL_MAP_PROFILE_SLOTS; i++) {
-		if(hl_hb_profile_slots[i].map == m)
-			return hl_hb_profile_slots[i].first_key;
-	}
-	return "(unknown)";
-}
-
-static void hl_hb_profile_large_map(hl_hb_map *m, int threshold) {
-	const char *first_key = hl_hb_profile_get_first_key(m);
-	fprintf(stderr, "HL_MAP_PROFILE: threshold=%d maxentries=%d first_key=\"%s\"\n",
-		threshold, m->maxentries, first_key);
-}
-#endif
-
 // Lookup table for pre-sizing bytes maps based on first key prefix
-// Populated from profiling data - add entries discovered via HL_MAP_PROFILE
+// Add entries here when warnings appear about maps growing past 1000 entries
 static struct { const char *prefix; int target_size; } hl_hb_presets[] = {
 	// Atlas animation maps (reach 8000+ entries)
 	{"activationLevier_", 10949},
@@ -314,26 +279,34 @@ static void hl_hb_presize_check(hl_hb_map *m, uchar *key) {
 
 // Custom bytes map functions with pre-sizing support
 
+// Simple first-key tracking for warning on missed pre-sizing
+static hl_hb_map *hl_hb_tracked_map = NULL;
+static char hl_hb_tracked_first_key[128];
+
 HL_PRIM void hl_hbset( hl_hb_map *m, uchar *key, vdynamic *value ) {
 	key = hl_hbfilter(key);
+	int old_maxentries = m->maxentries;
+
 	// Check for pre-sizing on first insert
 	if(m->nentries == 0) {
-#ifdef HL_MAP_PROFILE
-		hl_hb_profile_record_first_key(m, key);
-#endif
 		hl_hb_presize_check(m, key);
-	}
-	hl_hbset_impl(m, key, value);
-#ifdef HL_MAP_PROFILE
-	// Profile maps crossing thresholds
-	static const int thresholds[] = {100, 500, 1000, 2000, 4000, 8000, 0};
-	for(int i = 0; thresholds[i]; i++) {
-		if(m->nentries == thresholds[i]) {
-			hl_hb_profile_large_map(m, thresholds[i]);
-			break;
+		// Track first key for potential warning (reuse single slot)
+		hl_hb_tracked_map = m;
+		int j = 0;
+		for(int i = 0; key[i] && j < 127; i++) {
+			if(key[i] < 128) hl_hb_tracked_first_key[j++] = (char)key[i];
 		}
+		hl_hb_tracked_first_key[j] = 0;
 	}
-#endif
+
+	hl_hbset_impl(m, key, value);
+
+	// Warn if map grew past 1000 entries (pre-sizing heuristic missed)
+	if(m->maxentries > old_maxentries && m->maxentries >= 1000 && old_maxentries < 1000) {
+		const char *first_key = (hl_hb_tracked_map == m) ? hl_hb_tracked_first_key : "(unknown)";
+		fprintf(stderr, "[HL] Map grew to %d entries, consider pre-sizing for first_key=\"%s\"\n",
+			m->maxentries, first_key);
+	}
 }
 
 HL_PRIM bool hl_hbexists( hl_hb_map *m, uchar *key ) {

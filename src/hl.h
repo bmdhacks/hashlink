@@ -644,6 +644,11 @@ HL_API bool hl_is_ptr( hl_type *t );
 HL_API bool hl_same_type( hl_type *a, hl_type *b );
 HL_API bool hl_safe_cast( hl_type *t, hl_type *to );
 
+/* Fast inline check for dynamic types (matches hl_is_dynamic) */
+/* Bits: HDYN=9, HFUN=10, HOBJ=11, HARRAY=12, HVIRTUAL=15, HDYNOBJ=16, HENUM=18, HNULL=19 */
+#define HL_IS_DYNAMIC_MASK 0xD9E00
+#define hl_is_dynamic_fast(t) (((1 << (t)->kind) & HL_IS_DYNAMIC_MASK) != 0)
+
 #define hl_aptr(a,t)	((t*)(((varray*)(a))+1))
 
 HL_API varray *hl_alloc_array( hl_type *t, int size );

@@ -196,7 +196,7 @@ HL_PRIM vdynamic* hl_call_method( vdynamic *c, varray *args ) {
 			return r;
 		}
 	}
-	if( ret == NULL || hl_is_dynamic(tret) )
+	if( ret == NULL || hl_is_dynamic_fast(tret) )
 		return (vdynamic*)ret;
 	dret = hl_alloc_dynamic(tret);
 	dret->v.ptr = ret;

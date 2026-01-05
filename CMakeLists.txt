@@ -24,7 +24,6 @@ set(WITH_VM_DEFAULT ON)
 
 option(WITH_VM "Whether to build the Hashlink virtual machine" ${WITH_VM_DEFAULT})
 option(WITH_LLVM_AOT "Whether to build the hl2llvm AOT compiler" OFF)
-option(HL_MAP_PROFILE "Enable profiling of large StringMaps" OFF)
 option(BUILD_SHARED_LIBS "Build using shared libraries" ON)
 if(BUILD_SHARED_LIBS)
     # ensure third-party static libs are built with PIC
@@ -51,10 +50,6 @@ endif()
 if(MSVC)
     add_definitions(-DUNICODE -D_UNICODE)
     add_compile_options(/permissive-)
-endif()
-
-if(HL_MAP_PROFILE)
-    add_definitions(-DHL_MAP_PROFILE)
 endif()
 
 if (MINGW)

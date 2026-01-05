@@ -110,7 +110,7 @@ HL_PRIM int hl_dyn_casti( void *data, hl_type *t, hl_type *to ) {
 		vdynamic *v = *((vdynamic**)data);
 		if( v == NULL ) return 0;
 		t = v->t;
-		if( !hl_is_dynamic(t) ) data = &v->v;
+		if( !hl_is_dynamic_fast(t) ) data = &v->v;
 	}
 	switch( t->kind ) {
 	case HUI8:
@@ -147,7 +147,7 @@ HL_PRIM int64 hl_dyn_casti64( void *data, hl_type *t ) {
 		vdynamic *v = *((vdynamic**)data);
 		if( v == NULL ) return 0;
 		t = v->t;
-		if( !hl_is_dynamic(t) ) data = &v->v;
+		if( !hl_is_dynamic_fast(t) ) data = &v->v;
 	}
 	switch( t->kind ) {
 	case HUI8:
@@ -180,7 +180,7 @@ HL_PRIM int64 hl_dyn_casti64( void *data, hl_type *t ) {
 
 HL_PRIM void *hl_dyn_castp( void *data, hl_type *t, hl_type *to ) {
 	hl_track_call(HL_TRACK_CAST, on_cast(t,to));
-	if( to->kind == HDYN && hl_is_dynamic(t) )
+	if( to->kind == HDYN && hl_is_dynamic_fast(t) )
 		return *(vdynamic**)data;
 	if( t->kind == HDYN || t->kind == HNULL ) {
 		vdynamic *v = *(vdynamic**)data;
@@ -189,8 +189,8 @@ HL_PRIM void *hl_dyn_castp( void *data, hl_type *t, hl_type *to ) {
 		if( to->kind == HNULL && v->t == to->tparam && hl_is_gc_ptr(v) )
 			return v; // v might be a vdynamic on the stack
 		t = v->t;
-		if( !hl_is_dynamic(t) ) data = &v->v;
-	} else if( hl_is_dynamic(t) ) {
+		if( !hl_is_dynamic_fast(t) ) data = &v->v;
+	} else if( hl_is_dynamic_fast(t) ) {
 		vdynamic *v = *(vdynamic**)data;
 		if( v == NULL ) return NULL;
 		t = v->t;
@@ -325,7 +325,7 @@ HL_PRIM double hl_dyn_castd( void *data, hl_type *t ) {
 		vdynamic *v = *((vdynamic**)data);
 		if( v == NULL ) return 0;
 		t = v->t;
-		if( !hl_is_dynamic(t) ) data = &v->v;
+		if( !hl_is_dynamic_fast(t) ) data = &v->v;
 	}
 	switch( t->kind ) {
 	case HF32:
@@ -361,7 +361,7 @@ HL_PRIM float hl_dyn_castf( void *data, hl_type *t ) {
 		vdynamic *v = *((vdynamic**)data);
 		if( v == NULL ) return 0;
 		t = v->t;
-		if( !hl_is_dynamic(t) ) data = &v->v;
+		if( !hl_is_dynamic_fast(t) ) data = &v->v;
 	}
 	switch( t->kind ) {
 	case HF32:
@@ -590,7 +590,7 @@ HL_PRIM vdynamic *hl_dyn_op( int op, vdynamic *a, vdynamic *b ) {
 }
 
 HL_PRIM int64 hl_value_address( vdynamic *v ) {
-	return (int64)(int_val)(v && !hl_is_dynamic(v->t) ? v->v.ptr : v);
+	return (int64)(int_val)(v && !hl_is_dynamic_fast(v->t) ? v->v.ptr : v);
 }
 
 DEFINE_PRIM(_I32, dyn_compare, _DYN _DYN);
