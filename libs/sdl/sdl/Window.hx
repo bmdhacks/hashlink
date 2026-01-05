@@ -293,6 +293,16 @@ class Window {
 		lastFrame = haxe.Timer.stamp();
 	}
 
+	/**
+		Enable or disable threaded buffer swap.
+		When enabled, SDL_GL_SwapWindow runs on a separate thread, allowing the
+		main thread to continue game logic during vsync wait.
+		Auto-enabled on ARM platforms; use HL_THREADED_SWAP env var to override.
+	**/
+	public function setThreadedSwap( enabled : Bool ) {
+		winSetThreadedSwap(win, glctx, enabled);
+	}
+
 	public function destroy() {
 		try winDestroy(win, glctx) catch( e : Dynamic ) {};
 		win = null;
@@ -389,6 +399,10 @@ class Window {
 	}
 
 	static function winRenderTo( win : WinPtr, gl : GLContext ) {
+	}
+
+	@:hlNative("?sdl", "win_set_threaded_swap")
+	static function winSetThreadedSwap( win : WinPtr, gl : GLContext, enabled : Bool ) {
 	}
 
 	static function winDestroy( win : WinPtr, gl : GLContext ) {

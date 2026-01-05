@@ -102,6 +102,42 @@ typedef struct {
 	vbyte* dropFile;
 } event_data;
 
+// Threaded swap context for moving SDL_GL_SwapWindow to a worker thread
+// This allows the main thread to continue game logic during vsync wait
+typedef struct {
+	SDL_Window* win;
+	SDL_GLContext gl;
+	SDL_Thread* swap_thread;
+	SDL_cond* cond;           // Signals swap thread
+	SDL_mutex* cond_mutex;    // Protects condition + flags
+	bool swap_requested;
+	bool swap_started;        // Set when swap thread has acquired context
+	bool running;
+} threaded_swap_ctx;
+
+static threaded_swap_ctx* tswap = NULL;
+static int threaded_swap_enabled = -1; // -1 = not checked, 0 = disabled, 1 = enabled
+
+// GL context mutex for threaded swap - shared with gl.c
+static SDL_mutex* gl_context_mutex = NULL;
+static bool gl_need_reacquire = false;
+
+// Called from gl.c before any GL operation
+HL_API void sdl_gl_ensure_context(void) {
+	if (!gl_need_reacquire || !tswap) return;
+
+	// Wait for swap thread to finish
+	hl_blocking(true);
+	SDL_LockMutex(gl_context_mutex);
+	hl_blocking(false);
+
+	// Restore context to main thread
+	SDL_GL_MakeCurrent(tswap->win, tswap->gl);
+	gl_need_reacquire = false;
+
+	// Keep mutex held until next swap_window releases it
+}
+
 // FPS counter (enabled via HL_PRINT_FPS=1)
 #ifndef HL_WIN
 static int fps_enabled = -1; // -1 = not checked
@@ -126,7 +162,7 @@ static void fps_update(void) {
 		fps_frame_count = 0;
 	} else if (current_time - fps_last_time >= 1.0) {
 		double fps = fps_frame_count / (current_time - fps_last_time);
-		printf("[HL] FPS: %.2f\n", fps);
+		printf("[HL] FPS: %.2f%s\n", fps, tswap ? " (threaded swap)" : "");
 		fps_frame_count = 0;
 		fps_last_time = current_time;
 	}
@@ -134,6 +170,77 @@ static void fps_update(void) {
 #else
 static void fps_update(void) {}
 #endif
+
+static int swap_thread_func(void* data) {
+	threaded_swap_ctx* ctx = (threaded_swap_ctx*)data;
+	while (ctx->running) {
+		// Wait for swap request
+		SDL_LockMutex(ctx->cond_mutex);
+		while (!ctx->swap_requested && ctx->running) {
+			SDL_CondWait(ctx->cond, ctx->cond_mutex);
+		}
+		if (!ctx->running) {
+			SDL_UnlockMutex(ctx->cond_mutex);
+			break;
+		}
+		ctx->swap_requested = false;
+		SDL_UnlockMutex(ctx->cond_mutex);
+
+		// Acquire GL context mutex FIRST
+		SDL_LockMutex(gl_context_mutex);
+
+		// NOW signal that we have the mutex - main can safely return
+		SDL_LockMutex(ctx->cond_mutex);
+		ctx->swap_started = true;
+		SDL_CondSignal(ctx->cond);
+		SDL_UnlockMutex(ctx->cond_mutex);
+
+		// Take GL context, swap, then release context
+		SDL_GL_MakeCurrent(ctx->win, ctx->gl);
+		SDL_GL_SwapWindow(ctx->win);
+		SDL_GL_MakeCurrent(ctx->win, NULL); // Release context
+
+		// Release mutex so main thread can reacquire
+		SDL_UnlockMutex(gl_context_mutex);
+	}
+	return 0;
+}
+
+static bool should_use_threaded_swap(void) {
+	if (threaded_swap_enabled < 0) {
+		const char* env = getenv("HL_THREADED_SWAP");
+		if (env) {
+			threaded_swap_enabled = (env[0] == '1');
+		} else {
+#if defined(HL_ARM64) || defined(__aarch64__)
+			threaded_swap_enabled = 1;  // Auto-enable on ARM
+#else
+			threaded_swap_enabled = 0;
+#endif
+		}
+	}
+	return threaded_swap_enabled == 1;
+}
+
+static void init_threaded_swap(SDL_Window *win, SDL_GLContext gl) {
+	if (tswap || !should_use_threaded_swap()) return;
+
+	// Create GL context mutex for synchronization with gl.c
+	// Main thread already has context current, so lock mutex and mark as acquired
+	gl_context_mutex = SDL_CreateMutex();
+	SDL_LockMutex(gl_context_mutex);
+	gl_need_reacquire = false;  // We have context and mutex
+
+	tswap = (threaded_swap_ctx*)malloc(sizeof(threaded_swap_ctx));
+	tswap->win = win;
+	tswap->gl = gl;
+	tswap->cond = SDL_CreateCond();
+	tswap->cond_mutex = SDL_CreateMutex();
+	tswap->swap_requested = false;
+	tswap->swap_started = false;
+	tswap->running = true;
+	tswap->swap_thread = SDL_CreateThread(swap_thread_func, "SwapThread", tswap);
+}
 
 static bool isGlOptionsSet = false;
 
@@ -748,16 +855,83 @@ HL_PRIM void HL_NAME(win_swap_window)(SDL_Window *win) {
 	glBindFramebuffer(GL_FRAMEBUFFER, info.info.uikit.framebuffer);
 	glBindRenderbuffer(GL_RENDERBUFFER,info.info.uikit.colorbuffer);
 #endif
-	SDL_GL_SwapWindow(win);
+	// Auto-initialize on first call if not already done (for games that don't call renderTo)
+	if (!tswap && should_use_threaded_swap()) {
+		SDL_GLContext gl = SDL_GL_GetCurrentContext();
+		if (gl) {
+			init_threaded_swap(win, gl);
+		}
+	}
+
+	if (tswap) {
+		// Release GL context mutex if we're holding it (from previous frame's GL calls)
+		// Set gl_need_reacquire = true BEFORE unlocking to prevent race where
+		// a GL call sneaks in between unlock and setting the flag
+		if (!gl_need_reacquire) {
+			// MUST release context from main thread before swap thread can acquire it
+			// EGL requires context to not be current on any thread before MakeCurrent on another
+			SDL_GL_MakeCurrent(tswap->win, NULL);
+			gl_need_reacquire = true;
+			SDL_UnlockMutex(gl_context_mutex);
+		}
+
+		// Signal swap thread and wait for it to acquire the mutex
+		// This prevents race where main thread re-acquires before swap thread
+		SDL_LockMutex(tswap->cond_mutex);
+		tswap->swap_started = false;  // Reset for this frame
+		tswap->swap_requested = true;
+		SDL_CondSignal(tswap->cond);
+
+		// Wait for swap thread to confirm it has the GL context mutex
+		hl_blocking(true);
+		while (!tswap->swap_started && tswap->running) {
+			SDL_CondWait(tswap->cond, tswap->cond_mutex);
+		}
+		hl_blocking(false);
+		SDL_UnlockMutex(tswap->cond_mutex);
+
+		// Return - main thread can do game logic
+		// First GL call will block until swap completes
+	} else {
+		SDL_GL_SwapWindow(win);
+	}
+
 	fps_update();
 }
 
 HL_PRIM void HL_NAME(win_render_to)(SDL_Window *win, SDL_GLContext gl) {
+	// Auto-initialize threaded swap on first call (ARM platforms)
+	// Note: Most games init in swap_window, but this catches games that call renderTo first
+	if (!tswap && should_use_threaded_swap()) {
+		init_threaded_swap(win, gl);
+	}
+	// Note: Mutex synchronization happens in swap_window, not here
 	SDL_GL_MakeCurrent(win, gl);
 }
 
 HL_PRIM int HL_NAME(win_get_id)(SDL_Window *window) {
 	return SDL_GetWindowID(window);
+}
+
+HL_PRIM void HL_NAME(win_set_threaded_swap)(SDL_Window *win, SDL_GLContext gl, bool enabled) {
+	threaded_swap_enabled = enabled ? 1 : 0;
+	if (enabled && !tswap) {
+		init_threaded_swap(win, gl);
+	} else if (!enabled && tswap) {
+		// Shutdown swap thread
+		SDL_LockMutex(tswap->cond_mutex);
+		tswap->running = false;
+		SDL_CondSignal(tswap->cond);
+		SDL_UnlockMutex(tswap->cond_mutex);
+		SDL_WaitThread(tswap->swap_thread, NULL);
+		SDL_DestroyCond(tswap->cond);
+		SDL_DestroyMutex(tswap->cond_mutex);
+		SDL_DestroyMutex(gl_context_mutex);
+		gl_context_mutex = NULL;
+		gl_need_reacquire = false;
+		free(tswap);
+		tswap = NULL;
+	}
 }
 
 HL_PRIM void HL_NAME(win_destroy)(SDL_Window *win, SDL_GLContext gl) {
@@ -787,6 +961,7 @@ DEFINE_PRIM(_F64, win_get_opacity, TWIN);
 DEFINE_PRIM(_BOOL, win_set_opacity, TWIN _F64);
 DEFINE_PRIM(_VOID, win_swap_window, TWIN);
 DEFINE_PRIM(_VOID, win_render_to, TWIN TGL);
+DEFINE_PRIM(_VOID, win_set_threaded_swap, TWIN TGL _BOOL);
 DEFINE_PRIM(_VOID, win_destroy, TWIN TGL);
 DEFINE_PRIM(_I32, win_get_id, TWIN);
 
