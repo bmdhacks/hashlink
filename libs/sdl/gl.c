@@ -134,6 +134,9 @@ static int gl_debug_call_count = 0;
 #define GL_LOG_TEX(fmt, ...)
 #endif
 
+// Shader debug - print shaders when HL_SHADER_DEBUG=1
+static int shader_debug_enabled = -1;
+
 // globals
 HL_PRIM bool HL_NAME(gl_init)() {
 	return GLLoadAPI() == 0;
@@ -397,6 +400,22 @@ HL_PRIM vdynamic *HL_NAME(gl_create_shader)( int type ) {
 HL_PRIM void HL_NAME(gl_shader_source)( vdynamic *s, vstring *src ) {
 	GL_ENSURE_CONTEXT();
 	const GLchar *c = (GLchar*)hl_to_utf8(src->bytes);
+	if (shader_debug_enabled < 0) {
+		const char *env = getenv("HL_SHADER_DEBUG");
+		shader_debug_enabled = (env && env[0] == '1');
+	}
+	if (shader_debug_enabled) {
+		int type = 0;
+		glGetShaderiv(s->v.i, 0x8B4F/*GL_SHADER_TYPE*/, &type);
+		const char *type_name = "unknown";
+		switch (type) {
+			case 0x8B31: type_name = "vertex"; break;
+			case 0x8B30: type_name = "fragment"; break;
+			case 0x91B9: type_name = "compute"; break;
+			case 0x8DD9: type_name = "geometry"; break;
+		}
+		fprintf(stderr, "=== Shader %d (%s) ===\n%s\n================\n", s->v.i, type_name, c);
+	}
 	glShaderSource(s->v.i, 1, &c, NULL);
 }
 
