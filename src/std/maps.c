@@ -212,32 +212,69 @@ typedef struct {
 
 // ----- BYTES MAP PRESIZING ---------------------------------
 
-// Lookup table for pre-sizing bytes maps based on first key prefix
-// Add entries here when warnings appear about maps growing past 1000 entries
-static struct { const char *prefix; int target_size; } hl_hb_presets[] = {
-	// Atlas animation maps (reach 8000+ entries)
-	{"activationLevier_", 10949},
-	{"drink_", 10949},
-	// Animation/asset maps (reach 4000-5000 entries)
-	{"anims", 5471},
-	// Localization strings (reach 4000+ entries)
-	{"Abandonner", 5471},
-	// Lab/level data (reach 2000+ entries)
-	{"LabSeb", 2729},
-	// FX animation maps (reach 2000+ entries)
-	{"comboKickA/", 2729},
-	{"fxSpikeBootsA/", 2729},
-	{"fxGolemPunch/", 1361},
-	{"basherAtkFx/", 1361},
-	// UI/texture maps (reach 1000+ entries)
-	{"ui/", 1361},
-	{"64x64/", 1361},
-	{"DLCPurple/", 1361},
-	{"achemyPentagram", 1361},
-	{"affectBerserker", 1361},
-	{"fxDiamondRed", 710},
-	{NULL, 0}
-};
+// Dynamic preset list loaded from file
+typedef struct {
+	char *prefix;
+	int target_size;
+} hl_hb_preset;
+
+static hl_hb_preset *hl_hb_presets = NULL;
+static int hl_hb_presets_count = 0;
+static int hl_hb_presets_loaded = 0;  // 0=not loaded, 1=loaded, -1=disabled/failed
+static char hl_hb_presize_file_path[256] = "";
+
+static void hl_hb_load_presets(void) {
+	if (hl_hb_presets_loaded != 0) return;
+
+	// Get file path from env var or use default
+	const char *path = getenv("HL_MAP_PRESIZE_FILE");
+	if (!path || !path[0]) path = "map_presize.txt";
+	strncpy(hl_hb_presize_file_path, path, sizeof(hl_hb_presize_file_path) - 1);
+	hl_hb_presize_file_path[sizeof(hl_hb_presize_file_path) - 1] = 0;
+
+	FILE *f = fopen(path, "r");
+	if (!f) {
+		fprintf(stderr, "[HL] Map presize file not found: %s (presizing disabled)\n", path);
+		hl_hb_presets_loaded = -1;
+		return;
+	}
+
+	// Count lines first
+	char line[512];
+	int count = 0;
+	while (fgets(line, sizeof(line), f)) {
+		if (line[0] == '#' || line[0] == '\n' || line[0] == '\r') continue;
+		count++;
+	}
+
+	if (count == 0) {
+		fclose(f);
+		hl_hb_presets_loaded = 1;
+		return;
+	}
+
+	// Allocate and parse
+	hl_hb_presets = (hl_hb_preset*)malloc(count * sizeof(hl_hb_preset));
+	rewind(f);
+
+	int idx = 0;
+	while (fgets(line, sizeof(line), f) && idx < count) {
+		if (line[0] == '#' || line[0] == '\n' || line[0] == '\r') continue;
+
+		// Parse: prefix target_size
+		char prefix[256];
+		int target_size;
+		if (sscanf(line, "%255s %d", prefix, &target_size) == 2) {
+			hl_hb_presets[idx].prefix = strdup(prefix);
+			hl_hb_presets[idx].target_size = target_size;
+			idx++;
+		}
+	}
+
+	fclose(f);
+	hl_hb_presets_count = idx;
+	hl_hb_presets_loaded = 1;
+}
 
 static void hl_hb_presize_direct(hl_hb_map *m, int target_entries) {
 	// Directly allocate map to target size (single allocation)
@@ -260,8 +297,12 @@ static void hl_hb_presize_direct(hl_hb_map *m, int target_entries) {
 }
 
 static void hl_hb_presize_check(hl_hb_map *m, uchar *key) {
+	// Load presets on first call
+	hl_hb_load_presets();
+	if (hl_hb_presets_loaded != 1 || hl_hb_presets_count == 0) return;
+
 	// Check if key matches any preset prefix
-	for(int i = 0; hl_hb_presets[i].prefix; i++) {
+	for(int i = 0; i < hl_hb_presets_count; i++) {
 		const char *prefix = hl_hb_presets[i].prefix;
 		int match = 1;
 		for(int j = 0; prefix[j]; j++) {
@@ -304,8 +345,9 @@ HL_PRIM void hl_hbset( hl_hb_map *m, uchar *key, vdynamic *value ) {
 	// Warn if map grew past 1000 entries (pre-sizing heuristic missed)
 	if(m->maxentries > old_maxentries && m->maxentries >= 1000 && old_maxentries < 1000) {
 		const char *first_key = (hl_hb_tracked_map == m) ? hl_hb_tracked_first_key : "(unknown)";
-		fprintf(stderr, "[HL] Map grew to %d entries, consider pre-sizing for first_key=\"%s\"\n",
-			m->maxentries, first_key);
+		const char *file = hl_hb_presize_file_path[0] ? hl_hb_presize_file_path : "map_presize.txt";
+		fprintf(stderr, "[HL] Map presize: add to %s:\n%s %d\n",
+			file, first_key, m->maxentries);
 	}
 }
 
