@@ -447,6 +447,134 @@ static void gc_flush_empty_pages() {
 	}
 }
 
+// Tell OS to reclaim physical memory for free regions (Linux only)
+// IMPORTANT: We can only call madvise on an OS page if ALL GC blocks
+// that overlap with that page are free, because MADV_DONTNEED zeros the entire OS page.
+// We also must skip any OS pages that overlap with reserved metadata areas.
+#if defined(__linux__) && !defined(HL_CONSOLE)
+#include <sys/mman.h>
+#include <unistd.h>
+
+static int gc_madvise_enabled = -1;  // -1 = not initialized, 0 = disabled, 1 = enabled
+static long gc_os_page_size = 0;     // Actual OS page size (4KB, 16KB, 64KB, etc.)
+
+static void gc_madvise_free_regions() {
+	// Check if madvise is enabled (can be disabled via HL_GC_NO_MADVISE=1)
+	if( gc_madvise_enabled < 0 ) {
+		gc_madvise_enabled = getenv("HL_GC_NO_MADVISE") ? 0 : 1;
+		gc_os_page_size = sysconf(_SC_PAGESIZE);
+		if( gc_os_page_size <= 0 ) gc_os_page_size = 4096;  // fallback
+	}
+	if( !gc_madvise_enabled )
+		return;
+
+	long page_size = gc_os_page_size;
+	long page_mask = page_size - 1;
+
+	int i;
+	for(i=0;i<GC_ALL_PAGES;i++) {
+		gc_pheader *ph = gc_pages[i];
+		while( ph ) {
+			gc_allocator_page_data *p = &ph->alloc;
+
+			if( ph->bmp == NULL ) {
+				ph = ph->next_page;
+				continue;
+			}
+
+			int block_size = p->block_size;
+			int first_block = p->first_block;
+			int max_blocks = p->max_blocks;
+			unsigned char *bmp = ph->bmp;
+			unsigned char *base = ph->base;
+			int gc_page_size = ph->page_size;
+
+			if( p->sizes != NULL ) {
+				// Variable-size page: walk allocations to find contiguous free ranges
+				int bid = first_block;
+				int free_range_start = -1;  // byte offset, or -1 if not in a free range
+
+				while( bid < max_blocks ) {
+					int alloc_size = p->sizes[bid];
+					if( alloc_size == 0 ) alloc_size = 1;
+
+					bool is_live = (bmp[bid>>3] & (1<<(bid&7))) != 0;
+
+					if( is_live ) {
+						// End of free range - madvise any full OS pages within it
+						if( free_range_start >= 0 ) {
+							int free_range_end = bid * block_size;
+							// Align start up, end down to OS page boundaries
+							int aligned_start = (free_range_start + page_size - 1) & ~(page_size - 1);
+							int aligned_end = free_range_end & ~(page_size - 1);
+							if( aligned_end > aligned_start ) {
+								madvise(base + aligned_start, aligned_end - aligned_start, MADV_DONTNEED);
+							}
+							free_range_start = -1;
+						}
+					} else {
+						// Free allocation - extend or start free range
+						if( free_range_start < 0 ) {
+							free_range_start = bid * block_size;
+						}
+						// free_range implicitly extends to (bid + alloc_size) * block_size
+					}
+
+					bid += alloc_size;
+				}
+
+				// Handle trailing free range
+				if( free_range_start >= 0 ) {
+					int free_range_end = max_blocks * block_size;
+					if( free_range_end > gc_page_size ) free_range_end = gc_page_size;
+					int aligned_start = (free_range_start + page_size - 1) & ~(page_size - 1);
+					int aligned_end = free_range_end & ~(page_size - 1);
+					if( aligned_end > aligned_start ) {
+						madvise(base + aligned_start, aligned_end - aligned_start, MADV_DONTNEED);
+					}
+				}
+			} else {
+				// Fixed-size page: each block is one allocation, bitmap is authoritative
+				// Calculate the byte offset where usable blocks start
+				int usable_start_offset = first_block * block_size;
+				// Align up to next OS page boundary
+				int first_safe_os_page = (usable_start_offset + page_size - 1) & ~(page_size - 1);
+
+				// Iterate through each OS page that's FULLY within usable block range
+				for( int os_page_offset = first_safe_os_page; os_page_offset + page_size <= gc_page_size; os_page_offset += page_size ) {
+					// Calculate which blocks overlap with this OS page
+					int start_block = os_page_offset / block_size;
+					int end_block = (os_page_offset + page_size + block_size - 1) / block_size;
+					if( start_block < first_block ) start_block = first_block;
+					if( end_block > max_blocks ) end_block = max_blocks;
+
+					// Skip if this OS page doesn't contain any usable blocks
+					if( start_block >= end_block )
+						continue;
+
+					// Check if ALL blocks overlapping this OS page are free
+					bool all_free = true;
+					for( int bid = start_block; bid < end_block && all_free; bid++ ) {
+						if( bmp[bid>>3] & (1<<(bid&7)) ) {
+							all_free = false;  // Found a live block
+						}
+					}
+
+					if( all_free ) {
+						madvise(base + os_page_offset, page_size, MADV_DONTNEED);
+					}
+				}
+			}
+			ph = ph->next_page;
+		}
+	}
+}
+#else
+static void gc_madvise_free_regions() {
+	// No-op on non-Linux platforms
+}
+#endif
+
 static int64 gc_allocator_private_memory() {
 	return free_lists_size;
 }
@@ -599,6 +727,7 @@ static void gc_allocator_after_mark() {
 	gc_clear_unmarked_mem();
 #	endif
 	gc_flush_empty_pages();
+	gc_madvise_free_regions();
 }
 
 static void gc_get_stats( int *page_count, int *private_data ) {

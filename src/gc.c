@@ -582,6 +582,10 @@ typedef struct {
 } gc_mthread;
 
 static float gc_mark_threshold = 0.2f;
+static int64 gc_memory_limit = 0;  // 0 = no limit, otherwise hard limit in bytes
+static float gc_pressure_threshold = 0.8f;  // trigger GC at 80% system memory usage
+static int gc_pressure_check_interval = 1000;  // check every N allocations
+static int64 gc_last_pressure_check = 0;
 static int mark_size = 0;
 static unsigned char *mark_data = NULL;
 static gc_mstack global_mark_stack = {0};
@@ -936,13 +940,115 @@ HL_API int hl_gc_get_memsize( void *ptr ) {
 	return gc_allocator_fast_block_size(page,ptr);
 }
 
+// Memory pressure monitoring (Linux only)
+// Returns: 0 = no pressure, 1 = normal pressure (trigger GC), 2 = severe pressure (aggressive mode)
+#define GC_PRESSURE_NONE     0
+#define GC_PRESSURE_NORMAL   1
+#define GC_PRESSURE_SEVERE   2
+
+#if defined(__linux__) && !defined(HL_CONSOLE)
+static int gc_get_memory_pressure() {
+	// Check hard memory limit first
+	if( gc_memory_limit > 0 && gc_stats.pages_total_memory > gc_memory_limit )
+		return GC_PRESSURE_SEVERE;
+
+	// Check system memory pressure via /proc/meminfo
+	if( gc_pressure_threshold >= 0.99f )
+		return GC_PRESSURE_NONE;  // disabled
+
+	FILE *f = fopen("/proc/meminfo", "r");
+	if( !f ) return GC_PRESSURE_NONE;
+
+	char line[256];
+	int64 mem_total = 0, mem_available = 0, mem_free = 0;
+	while( fgets(line, sizeof(line), f) ) {
+		if( strncmp(line, "MemTotal:", 9) == 0 )
+			mem_total = strtoll(line + 9, NULL, 10) * 1024;
+		else if( strncmp(line, "MemAvailable:", 13) == 0 )
+			mem_available = strtoll(line + 13, NULL, 10) * 1024;
+		else if( strncmp(line, "MemFree:", 8) == 0 )
+			mem_free = strtoll(line + 8, NULL, 10) * 1024;
+	}
+	fclose(f);
+
+	// Fallback if MemAvailable not present (pre-3.14 kernels)
+	if( mem_available == 0 )
+		mem_available = mem_free;
+
+	if( mem_total == 0 )
+		return GC_PRESSURE_NONE;
+
+	float available_ratio = (float)mem_available / (float)mem_total;
+	float used_ratio = 1.0f - available_ratio;
+
+	// Severe pressure: less than 10% memory available
+	if( available_ratio < 0.10f )
+		return GC_PRESSURE_SEVERE;
+	// Normal pressure: above configured threshold
+	if( used_ratio > gc_pressure_threshold )
+		return GC_PRESSURE_NORMAL;
+
+	return GC_PRESSURE_NONE;
+}
+#else
+static int gc_get_memory_pressure() {
+	// Only check hard limit on non-Linux platforms
+	if( gc_memory_limit > 0 && gc_stats.pages_total_memory > gc_memory_limit )
+		return GC_PRESSURE_SEVERE;
+	return GC_PRESSURE_NONE;
+}
+#endif
+
+static float gc_current_threshold = 0.2f;  // Dynamically adjusted threshold
 
 static bool gc_is_active = true;
 
 static void gc_check_mark() {
 	int64 m = gc_stats.total_allocated - gc_stats.last_mark;
 	int64 b = gc_stats.allocation_count - gc_stats.last_mark_allocs;
-	if( (m > gc_stats.pages_total_memory * gc_mark_threshold || b > gc_stats.pages_blocks * gc_mark_threshold || (gc_flags & GC_FORCE_MAJOR)) && gc_is_active )
+	bool should_gc = false;
+
+	// Use dynamically adjusted threshold (gc_current_threshold)
+	float threshold = gc_current_threshold;
+
+	// Existing threshold-based trigger
+	if( (m > gc_stats.pages_total_memory * threshold || b > gc_stats.pages_blocks * threshold || (gc_flags & GC_FORCE_MAJOR)) && gc_is_active )
+		should_gc = true;
+
+	// Memory pressure check (periodic to minimize overhead)
+	if( gc_is_active && gc_stats.allocation_count - gc_last_pressure_check > gc_pressure_check_interval ) {
+		gc_last_pressure_check = gc_stats.allocation_count;
+		int pressure = gc_get_memory_pressure();
+
+		if( pressure == GC_PRESSURE_SEVERE ) {
+			// Severe pressure: aggressively reduce threshold and force GC
+			gc_current_threshold = gc_mark_threshold * 0.25f;  // 25% of normal
+			if( gc_current_threshold < 0.01f ) gc_current_threshold = 0.01f;
+			if( gc_flags & GC_PROFILE )
+				fprintf(stderr, "[GC] SEVERE pressure: heap=%.1fMB limit=%.1fMB threshold=%.0f%%\n",
+					gc_stats.pages_total_memory / (1024.0 * 1024.0),
+					gc_memory_limit / (1024.0 * 1024.0),
+					gc_current_threshold * 100.0);
+			should_gc = true;
+		} else if( pressure == GC_PRESSURE_NORMAL ) {
+			// Normal pressure: moderately reduce threshold
+			gc_current_threshold = gc_mark_threshold * 0.5f;  // 50% of normal
+			if( gc_flags & GC_PROFILE )
+				fprintf(stderr, "[GC] Normal pressure: heap=%.1fMB threshold=%.0f%%\n",
+					gc_stats.pages_total_memory / (1024.0 * 1024.0),
+					gc_current_threshold * 100.0);
+			should_gc = true;
+		} else {
+			// No pressure: gradually restore threshold back to normal
+			if( gc_current_threshold < gc_mark_threshold ) {
+				gc_current_threshold += (gc_mark_threshold - gc_current_threshold) * 0.1f;
+				if( gc_current_threshold > gc_mark_threshold * 0.99f )
+					gc_current_threshold = gc_mark_threshold;
+			}
+		}
+	}
+
+	if( should_gc )
 		gc_major();
 }
 
@@ -978,6 +1084,24 @@ static void hl_gc_init() {
 		gc_flags |= GC_PROFILE_MEM;
 	if( getenv("HL_DUMP_MEMORY") )
 		gc_flags |= GC_DUMP_MEM;
+	{
+		char *threshold = getenv("HL_GC_THRESHOLD");
+		if( threshold ) {
+			gc_mark_threshold = (float)atof(threshold);
+			if( gc_mark_threshold < 0.01f ) gc_mark_threshold = 0.01f;
+			if( gc_mark_threshold > 1.0f ) gc_mark_threshold = 1.0f;
+		}
+		char *mem_limit = getenv("HL_GC_MEMORY_LIMIT");
+		if( mem_limit )
+			gc_memory_limit = strtoll(mem_limit, NULL, 10);
+		char *pressure = getenv("HL_GC_PRESSURE_THRESHOLD");
+		if( pressure ) {
+			gc_pressure_threshold = (float)atof(pressure);
+			if( gc_pressure_threshold < 0.1f ) gc_pressure_threshold = 0.1f;
+			if( gc_pressure_threshold > 0.99f ) gc_pressure_threshold = 0.99f;
+		}
+		gc_current_threshold = gc_mark_threshold;  // Initialize dynamic threshold
+	}
 #	endif
 	gc_stats.mark_bytes = 4; // prevent reading out of bmp
 	memset(&gc_threads,0,sizeof(gc_threads));
@@ -1054,6 +1178,7 @@ void hl_global_init() {
 }
 
 void hl_global_free() {
+	hl_hb_dump_presize_info();
 	hl_cache_free();
 	hl_gc_free();
 }
