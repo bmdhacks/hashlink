@@ -834,6 +834,7 @@ HL_API void hl_free( hl_alloc *a );
 HL_API void hl_global_init( void );
 HL_API void hl_global_free( void );
 HL_API void hl_global_lock( bool lock );
+HL_API void hl_hb_dump_presize_info( void );
 
 HL_API void *hl_alloc_executable_memory( int size );
 HL_API void hl_free_executable_memory( void *ptr, int size );

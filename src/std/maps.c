@@ -226,6 +226,10 @@ static char hl_hb_presize_file_path[256] = "";
 static void hl_hb_load_presets(void) {
 	if (hl_hb_presets_loaded != 0) return;
 
+	// Register dump on exit (declared below, defined above after this point)
+	extern void hl_hb_dump_presize_info(void);
+	atexit(hl_hb_dump_presize_info);
+
 	// Get file path from env var or use default
 	const char *path = getenv("HL_MAP_PRESIZE_FILE");
 	if (!path || !path[0]) path = "map_presize.txt";
@@ -261,19 +265,28 @@ static void hl_hb_load_presets(void) {
 	while (fgets(line, sizeof(line), f) && idx < count) {
 		if (line[0] == '#' || line[0] == '\n' || line[0] == '\r') continue;
 
-		// Parse: prefix target_size
-		char prefix[256];
-		int target_size;
-		if (sscanf(line, "%255s %d", prefix, &target_size) == 2) {
-			hl_hb_presets[idx].prefix = strdup(prefix);
-			hl_hb_presets[idx].target_size = target_size;
-			idx++;
+		// Strip trailing whitespace
+		int len = strlen(line);
+		while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r' || line[len-1] == ' '))
+			line[--len] = '\0';
+
+		// Parse from end: find last space, number after it is target_size
+		char *last_space = strrchr(line, ' ');
+		if (last_space && last_space > line) {
+			int target_size = atoi(last_space + 1);
+			if (target_size > 0) {
+				*last_space = '\0';
+				hl_hb_presets[idx].prefix = strdup(line);
+				hl_hb_presets[idx].target_size = target_size;
+				idx++;
+			}
 		}
 	}
 
 	fclose(f);
 	hl_hb_presets_count = idx;
 	hl_hb_presets_loaded = 1;
+	fprintf(stderr, "[HL] Loaded %d map presize entries from %s\n", idx, path);
 }
 
 static void hl_hb_presize_direct(hl_hb_map *m, int target_entries) {
@@ -320,34 +333,128 @@ static void hl_hb_presize_check(hl_hb_map *m, uchar *key) {
 
 // Custom bytes map functions with pre-sizing support
 
-// Simple first-key tracking for warning on missed pre-sizing
-static hl_hb_map *hl_hb_tracked_map = NULL;
-static char hl_hb_tracked_first_key[128];
+// Track maps that grow large (for reporting final sizes on exit)
+#define HL_HB_TRACK_MAX 512
+typedef struct {
+	hl_hb_map *map;
+	char first_key[128];
+	int was_presized;
+	int last_seen_size;  // last known valid maxentries
+} hl_hb_track_entry;
+
+static hl_hb_track_entry hl_hb_tracked[HL_HB_TRACK_MAX];
+static int hl_hb_tracked_count = 0;
+
+static hl_hb_track_entry* hl_hb_find_tracked(hl_hb_map *m) {
+	for (int i = 0; i < hl_hb_tracked_count; i++) {
+		if (hl_hb_tracked[i].map == m) return &hl_hb_tracked[i];
+	}
+	return NULL;
+}
+
+static void hl_hb_add_tracked(hl_hb_map *m, uchar *key, int was_presized) {
+	if (hl_hb_tracked_count >= HL_HB_TRACK_MAX) return;
+	hl_hb_track_entry *e = &hl_hb_tracked[hl_hb_tracked_count++];
+	e->map = m;
+	e->was_presized = was_presized;
+	e->last_seen_size = m->maxentries;
+	int j = 0;
+	for (int i = 0; key[i] && j < 127; i++) {
+		if (key[i] < 128) e->first_key[j++] = (char)key[i];
+	}
+	e->first_key[j] = 0;
+}
+
+static int hl_hb_dump_done = 0;
+
+// Deduplicated output entry
+typedef struct {
+	char key[128];
+	int max_size;
+} hl_hb_output_entry;
+
+// Find next size in H_PRIMES progression after given size
+static int hl_hb_next_valid_size(int size) {
+	int n = sizeof(H_PRIMES) / sizeof(H_PRIMES[0]);
+	for (int i = 0; i < n; i++) {
+		if (H_PRIMES[i] > size) return H_PRIMES[i];
+	}
+	return size * 2;  // fallback for sizes beyond table
+}
+
+// Validate size: must be >= last_seen and <= next step in progression
+static int hl_hb_validate_size(int current, int last_seen) {
+	if (last_seen <= 0) return current;  // no baseline
+	int next_valid = hl_hb_next_valid_size(last_seen);
+	if (current >= last_seen && current <= next_valid) return current;  // valid
+	return last_seen;  // fallback to last known good
+}
+
+HL_API void hl_hb_dump_presize_info(void) {
+	if (hl_hb_dump_done) return;
+	hl_hb_dump_done = 1;
+
+	// Collect and deduplicate: keep max size per unique key
+	hl_hb_output_entry *output = (hl_hb_output_entry*)malloc(hl_hb_tracked_count * sizeof(hl_hb_output_entry));
+	int output_count = 0;
+
+	for (int i = 0; i < hl_hb_tracked_count; i++) {
+		hl_hb_track_entry *e = &hl_hb_tracked[i];
+		if (e->was_presized) continue;
+
+		int current = e->map ? e->map->maxentries : 0;
+		int size = hl_hb_validate_size(current, e->last_seen_size);
+
+		if (size < 1000) continue;
+
+		// Find existing or add new
+		int found = -1;
+		for (int j = 0; j < output_count; j++) {
+			if (strcmp(output[j].key, e->first_key) == 0) {
+				found = j;
+				break;
+			}
+		}
+		if (found >= 0) {
+			if (size > output[found].max_size) output[found].max_size = size;
+		} else {
+			strncpy(output[output_count].key, e->first_key, 127);
+			output[output_count].key[127] = 0;
+			output[output_count].max_size = size;
+			output_count++;
+		}
+	}
+
+	// Print results
+	if (output_count > 0) {
+		const char *file = hl_hb_presize_file_path[0] ? hl_hb_presize_file_path : "map_presize.txt";
+		fprintf(stderr, "[HL] Map presize suggestions for %s:\n", file);
+		for (int i = 0; i < output_count; i++) {
+			fprintf(stderr, "%s %d\n", output[i].key, output[i].max_size);
+		}
+	}
+
+	free(output);
+}
 
 HL_PRIM void hl_hbset( hl_hb_map *m, uchar *key, vdynamic *value ) {
 	key = hl_hbfilter(key);
 	int old_maxentries = m->maxentries;
 
-	// Check for pre-sizing on first insert
+	// Check for pre-sizing on first insert and start tracking
 	if(m->nentries == 0) {
 		hl_hb_presize_check(m, key);
-		// Track first key for potential warning (reuse single slot)
-		hl_hb_tracked_map = m;
-		int j = 0;
-		for(int i = 0; key[i] && j < 127; i++) {
-			if(key[i] < 128) hl_hb_tracked_first_key[j++] = (char)key[i];
-		}
-		hl_hb_tracked_first_key[j] = 0;
+		int was_presized = (m->maxentries > old_maxentries);
+		hl_hb_add_tracked(m, key, was_presized);
+		old_maxentries = m->maxentries;
 	}
 
 	hl_hbset_impl(m, key, value);
 
-	// Warn if map grew past 1000 entries (pre-sizing heuristic missed)
-	if(m->maxentries > old_maxentries && m->maxentries >= 1000 && old_maxentries < 1000) {
-		const char *first_key = (hl_hb_tracked_map == m) ? hl_hb_tracked_first_key : "(unknown)";
-		const char *file = hl_hb_presize_file_path[0] ? hl_hb_presize_file_path : "map_presize.txt";
-		fprintf(stderr, "[HL] Map presize: add to %s:\n%s %d\n",
-			file, first_key, m->maxentries);
+	// Track resize - update last_seen_size (O(n) but resizes are rare)
+	if (m->maxentries > old_maxentries) {
+		hl_hb_track_entry *e = hl_hb_find_tracked(m);
+		if (e) e->last_seen_size = m->maxentries;
 	}
 }
 
