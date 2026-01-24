@@ -1,9 +1,9 @@
 /*
  * JIT ELF Generation for Debug/Profiler Support
  *
- * When HL_JIT_DEBUG=1 is set, generates an ELF shared object containing
- * the JIT-compiled code with debug symbols. This allows profilers like
- * heaptrack, perf, and debuggers like GDB to show proper function names.
+ * When HL_JIT_DEBUG=1 is set, registers JIT-compiled code with GDB via
+ * the GDB JIT interface. This allows GDB to show proper function names
+ * for JIT-compiled code without writing files to disk.
  *
  * NOTE: This header must be included AFTER jit_common.h which provides
  * the necessary type definitions (jit_ctx, hl_module, etc.)
@@ -14,62 +14,88 @@
 
 #include <stdint.h>
 
+/* ========== GDB JIT Interface ========== */
 /*
- * Write JIT code as an ELF shared object.
+ * These structures and symbols implement the GDB JIT Compilation Interface.
+ * See: https://sourceware.org/gdb/current/onlinedocs/gdb/JIT-Interface.html
+ *
+ * GDB sets a breakpoint on __jit_debug_register_code(). When called,
+ * GDB reads __jit_debug_descriptor to find newly registered ELF objects.
+ */
+
+typedef enum {
+    JIT_NOACTION = 0,
+    JIT_REGISTER_FN,
+    JIT_UNREGISTER_FN
+} jit_actions_t;
+
+struct jit_code_entry {
+    struct jit_code_entry *next_entry;
+    struct jit_code_entry *prev_entry;
+    const char *symfile_addr;
+    uint64_t symfile_size;
+};
+
+struct jit_descriptor {
+    uint32_t version;
+    uint32_t action_flag;
+    struct jit_code_entry *relevant_entry;
+    struct jit_code_entry *first_entry;
+};
+
+/* Global symbols required by GDB JIT interface (defined in jit_elf.c) */
+extern struct jit_descriptor __jit_debug_descriptor;
+void __jit_debug_register_code(void);
+
+/*
+ * Register JIT code with GDB via the JIT interface.
+ *
+ * Creates an in-memory ELF object with debug symbols and registers it
+ * with GDB. No files are written to disk.
  *
  * Parameters:
- *   path      - Output file path (e.g., "/tmp/hl-jit-12345.so")
  *   ctx       - JIT context with debug info
  *   m         - HashLink module with function metadata
  *   code_size - Size of generated code in bytes
- *   code      - Pointer to generated machine code
+ *   code      - Pointer to generated machine code (already allocated)
  *
  * Returns:
- *   1 on success, 0 on failure
+ *   jit_code_entry pointer on success (for later cleanup), NULL on failure
  */
-int write_jit_elf(const char *path, jit_ctx *ctx, hl_module *m,
-                  int code_size, unsigned char *code);
+struct jit_code_entry *gdb_jit_register(jit_ctx *ctx, hl_module *m,
+                                        int code_size, unsigned char *code);
+
+/*
+ * Unregister JIT code from GDB.
+ *
+ * Call this when freeing the JIT code to inform GDB the symbols are no
+ * longer valid.
+ *
+ * Parameters:
+ *   entry - The entry returned by gdb_jit_register()
+ */
+void gdb_jit_unregister(struct jit_code_entry *entry);
 
 /* ELF constants for AArch64 */
 #define ELF_MAGIC       "\x7f" "ELF"
 #define ELFCLASS64      2
 #define ELFDATA2LSB     1       /* Little-endian */
 #define EV_CURRENT      1
+#define ET_REL          1       /* Relocatable object (used for GDB JIT) */
 #define ET_DYN          3       /* Shared object */
 #define EM_AARCH64      183
-
-/* Program header types */
-#define PT_NULL         0
-#define PT_LOAD         1
-#define PT_DYNAMIC      2
-#define PT_GNU_EH_FRAME 0x6474e550
-
-/* Program header flags */
-#define PF_X            1       /* Execute */
-#define PF_W            2       /* Write */
-#define PF_R            4       /* Read */
 
 /* Section header types */
 #define SHT_NULL        0
 #define SHT_PROGBITS    1
 #define SHT_SYMTAB      2
 #define SHT_STRTAB      3
-#define SHT_HASH        5
-#define SHT_DYNAMIC     6
-#define SHT_DYNSYM      11
+#define SHT_NOBITS      8       /* No file data, just address/size (used for .text in GDB JIT) */
 
 /* Section header flags */
 #define SHF_WRITE       1
 #define SHF_ALLOC       2
 #define SHF_EXECINSTR   4
-
-/* Dynamic section tags */
-#define DT_NULL         0
-#define DT_HASH         4
-#define DT_STRTAB       5
-#define DT_SYMTAB       6
-#define DT_STRSZ        10
-#define DT_SYMENT       11
 
 /* Symbol binding/type */
 #define STB_LOCAL       0
@@ -78,30 +104,6 @@ int write_jit_elf(const char *path, jit_ctx *ctx, hl_module *m,
 #define STT_FUNC        2
 
 #define ELF64_ST_INFO(bind, type) (((bind) << 4) | ((type) & 0xf))
-
-/* DWARF Call Frame Information (CFI) opcodes */
-#define DW_CFA_nop              0x00
-#define DW_CFA_advance_loc1     0x02
-#define DW_CFA_advance_loc2     0x03
-#define DW_CFA_advance_loc4     0x04
-#define DW_CFA_offset_extended  0x05
-#define DW_CFA_def_cfa          0x0c
-#define DW_CFA_def_cfa_register 0x0d
-#define DW_CFA_def_cfa_offset   0x0e
-#define DW_CFA_offset           0x80  /* High 2 bits = 10, low 6 bits = register */
-
-/* DWARF register numbers for AArch64 */
-#define DW_REG_X29      29  /* Frame pointer */
-#define DW_REG_X30      30  /* Link register (return address) */
-#define DW_REG_SP       31  /* Stack pointer */
-
-/* .eh_frame_hdr encodings */
-#define DW_EH_PE_omit       0xff
-#define DW_EH_PE_absptr     0x00
-#define DW_EH_PE_udata4     0x03
-#define DW_EH_PE_sdata4     0x0b
-#define DW_EH_PE_pcrel      0x10
-#define DW_EH_PE_datarel    0x30
 
 /* Special section indices */
 #define SHN_UNDEF       0
@@ -126,17 +128,6 @@ typedef struct {
 } Elf64_Ehdr;
 
 typedef struct {
-    uint32_t p_type;
-    uint32_t p_flags;
-    uint64_t p_offset;
-    uint64_t p_vaddr;
-    uint64_t p_paddr;
-    uint64_t p_filesz;
-    uint64_t p_memsz;
-    uint64_t p_align;
-} Elf64_Phdr;
-
-typedef struct {
     uint32_t sh_name;
     uint32_t sh_type;
     uint64_t sh_flags;
@@ -157,10 +148,5 @@ typedef struct {
     uint64_t st_value;
     uint64_t st_size;
 } Elf64_Sym;
-
-typedef struct {
-    int64_t d_tag;
-    uint64_t d_val;
-} Elf64_Dyn;
 
 #endif /* JIT_ELF_H */

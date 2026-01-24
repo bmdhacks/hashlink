@@ -131,6 +131,7 @@ void *hl_jit_code(jit_ctx *ctx, hl_module *m, int *size, hl_debug_infos **dbg, h
 }
 void hl_jit_reset(jit_ctx *ctx, hl_module *m) { (void)ctx; (void)m; }
 void hl_jit_patch_method(void *old_fun, void **new_fun) { (void)old_fun; (void)new_fun; }
+void gdb_jit_unregister(struct jit_code_entry *entry) { (void)entry; }  /* GDB JIT interface stub */
 
 /*
  * C2HL trampoline for dynamic function calls (AArch64).

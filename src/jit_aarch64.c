@@ -42,7 +42,6 @@
 #include <string.h>
 #include <stddef.h>
 #include <unistd.h>
-#include <dlfcn.h>
 #include <sys/mman.h>
 #include "jit_common.h"
 #include "jit_aarch64_emit.h"
@@ -6811,10 +6810,9 @@ void *hl_jit_code(jit_ctx *ctx, hl_module *m, int *codesize, hl_debug_infos **de
 	int code_size = BUF_POS();
 	unsigned char *code;
 	jlist *j;
-    unsigned int *insn_ptr;
-    unsigned int insn;
-	int use_elf_debug = getenv("HL_JIT_DEBUG") != NULL;
-	void *elf_handle = NULL;
+	unsigned int *insn_ptr;
+	unsigned int insn;
+	int use_gdb_jit = getenv("HL_JIT_DEBUG") != NULL;
 
 	// Round up code size to page boundary for memory allocation
 	int alloc_size = (code_size + 4095) & ~4095;
@@ -6822,31 +6820,7 @@ void *hl_jit_code(jit_ctx *ctx, hl_module *m, int *codesize, hl_debug_infos **de
 	// Note: Jump patching is now done at the end of each function in jit_function()
 	// This ensures ctx->opsPos contains the correct positions for each function's jumps
 
-	if (use_elf_debug) {
-		// Debug path: write ELF and dlopen for profiler/debugger support
-		char path[64];
-		snprintf(path, sizeof(path), "/tmp/hl-jit-%d.so", getpid());
-
-		if (write_jit_elf(path, ctx, m, code_size, ctx->startBuf)) {
-			elf_handle = dlopen(path, RTLD_NOW);
-			if (elf_handle) {
-				code = (unsigned char*)dlsym(elf_handle, "_hl_jit_code");
-				if (code) {
-					// Store handle for cleanup
-					m->jit_handle = elf_handle;
-					fprintf(stderr, "JIT ELF written to: %s (loaded at %p)\n", path, code);
-					goto do_patching;
-				}
-				fprintf(stderr, "dlsym failed for _hl_jit_code\n");
-				dlclose(elf_handle);
-			} else {
-				fprintf(stderr, "dlopen failed: %s\n", dlerror());
-			}
-		}
-		fprintf(stderr, "ELF debug mode failed, falling back to mmap\n");
-	}
-
-	// Default path: allocate executable memory directly
+	// Allocate executable memory
 	code = (unsigned char*)hl_alloc_executable_memory(alloc_size);
 	if (code == NULL) {
 		printf("JIT Error: Failed to allocate executable memory (%d bytes)\n", alloc_size);
@@ -6856,14 +6830,9 @@ void *hl_jit_code(jit_ctx *ctx, hl_module *m, int *codesize, hl_debug_infos **de
 	// Copy generated code to executable memory (with jumps already patched)
 	memcpy(code, ctx->startBuf, code_size);
 
-do_patching:
-	// If using ELF debug mode, make code writable for patching
-	if (elf_handle) {
-		uintptr_t page_start = (uintptr_t)code & ~0xFFFFUL;  // 64KB page alignment
-		size_t page_size = ((uintptr_t)code + code_size - page_start + 0xFFFF) & ~0xFFFFUL;
-		if (mprotect((void*)page_start, page_size, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
-			fprintf(stderr, "mprotect RWX failed for patching\n");
-		}
+	// Register with GDB JIT interface for debugging (if enabled)
+	if (use_gdb_jit) {
+		m->gdb_jit_entry = gdb_jit_register(ctx, m, code_size, code);
 	}
 
 	// Set up C↔HL trampolines and callbacks
@@ -6971,15 +6940,6 @@ do_patching:
 		ctx->closure_list = NULL;
 	}
 
-	// If using ELF debug mode, restore code to read-only after patching
-	if (elf_handle) {
-		uintptr_t page_start = (uintptr_t)code & ~0xFFFFUL;
-		size_t page_size = ((uintptr_t)code + code_size - page_start + 0xFFFF) & ~0xFFFFUL;
-		if (mprotect((void*)page_start, page_size, PROT_READ | PROT_EXEC) != 0) {
-			fprintf(stderr, "mprotect RX failed after patching\n");
-		}
-	}
-
 	// CRITICAL: Flush instruction cache on ARM64
 	// This ensures the CPU sees the newly written instructions
 	// Without this, the CPU might execute stale cached instructions
@@ -6996,8 +6956,8 @@ do_patching:
 		write_jit_debug_file(ctx, m, code, code_size);
 	}
 
-	// Write perf map for profiler support (when not using ELF debug mode)
-	if (ctx->debug && !elf_handle) {
+	// Write perf map for profiler support (when not using GDB JIT debug mode)
+	if (ctx->debug && !m->gdb_jit_entry) {
 		write_perf_map(ctx, m, code);
 	}
 
