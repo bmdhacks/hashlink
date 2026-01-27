@@ -584,7 +584,7 @@ typedef struct {
 static float gc_mark_threshold = 0.2f;
 static int64 gc_memory_limit = 0;  // 0 = no limit, otherwise hard limit in bytes
 static float gc_pressure_threshold = 0.8f;  // trigger GC at 80% system memory usage
-static int gc_pressure_check_interval = 1000;  // check every N allocations
+static int gc_pressure_check_interval = 10000;  // check every N allocations (less frequent = less overhead)
 static int64 gc_last_pressure_check = 0;
 static int mark_size = 0;
 static unsigned char *mark_data = NULL;
@@ -1021,23 +1021,23 @@ static void gc_check_mark() {
 		int pressure = gc_get_memory_pressure();
 
 		if( pressure == GC_PRESSURE_SEVERE ) {
-			// Severe pressure: aggressively reduce threshold and force GC
-			gc_current_threshold = gc_mark_threshold * 0.25f;  // 25% of normal
-			if( gc_current_threshold < 0.01f ) gc_current_threshold = 0.01f;
+			// Severe pressure: reduce threshold (GC will trigger sooner on next allocs)
+			gc_current_threshold = gc_mark_threshold * 0.5f;  // 50% of normal
+			if( gc_current_threshold < 0.05f ) gc_current_threshold = 0.05f;
 			if( gc_flags & GC_PROFILE )
 				fprintf(stderr, "[GC] SEVERE pressure: heap=%.1fMB limit=%.1fMB threshold=%.0f%%\n",
 					gc_stats.pages_total_memory / (1024.0 * 1024.0),
 					gc_memory_limit / (1024.0 * 1024.0),
 					gc_current_threshold * 100.0);
-			should_gc = true;
+			// Don't force GC here - let normal threshold trigger it
 		} else if( pressure == GC_PRESSURE_NORMAL ) {
-			// Normal pressure: moderately reduce threshold
-			gc_current_threshold = gc_mark_threshold * 0.5f;  // 50% of normal
+			// Normal pressure: slightly reduce threshold
+			gc_current_threshold = gc_mark_threshold * 0.75f;  // 75% of normal
 			if( gc_flags & GC_PROFILE )
 				fprintf(stderr, "[GC] Normal pressure: heap=%.1fMB threshold=%.0f%%\n",
 					gc_stats.pages_total_memory / (1024.0 * 1024.0),
 					gc_current_threshold * 100.0);
-			should_gc = true;
+			// Don't force GC here - let normal threshold trigger it
 		} else {
 			// No pressure: gradually restore threshold back to normal
 			if( gc_current_threshold < gc_mark_threshold ) {
