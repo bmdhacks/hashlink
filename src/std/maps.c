@@ -232,13 +232,15 @@ static void hl_hb_load_presets(void) {
 
 	// Get file path from env var or use default
 	const char *path = getenv("HL_MAP_PRESIZE_FILE");
-	if (!path || !path[0]) path = "map_presize.txt";
+	int explicit_path = path && path[0];
+	if (!explicit_path) path = "map_presize.txt";
 	strncpy(hl_hb_presize_file_path, path, sizeof(hl_hb_presize_file_path) - 1);
 	hl_hb_presize_file_path[sizeof(hl_hb_presize_file_path) - 1] = 0;
 
 	FILE *f = fopen(path, "r");
 	if (!f) {
-		fprintf(stderr, "[HL] Map presize file not found: %s (presizing disabled)\n", path);
+		if (explicit_path)
+			fprintf(stderr, "[HL] Map presize file not found: %s (presizing disabled)\n", path);
 		hl_hb_presets_loaded = -1;
 		return;
 	}
