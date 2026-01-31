@@ -127,6 +127,12 @@ GL_IMPORT(glTexStorage3D, TEXSTORAGE3D);
 
 GL_IMPORT(glDebugMessageCallback, DEBUGMESSAGECALLBACK);
 GL_IMPORT(glDebugMessageControl, DEBUGMESSAGECONTROL);
+#if !defined(HL_GLES31)
+GL_IMPORT(glPushDebugGroup, PUSHDEBUGGROUP);
+GL_IMPORT(glPopDebugGroup, POPDEBUGGROUP);
+GL_IMPORT(glObjectLabel, OBJECTLABEL);
+GL_IMPORT(glDebugMessageInsert, DEBUGMESSAGEINSERT);
+#endif
 
 #if !defined(HL_MESA) && !defined(HL_GLES31)
 GL_IMPORT(glGetQueryObjectui64v, GETQUERYOBJECTUI64V);

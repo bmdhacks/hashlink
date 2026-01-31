@@ -102,40 +102,41 @@ static int GLLoadAPI() {
 	return 0;
 }
 
-#ifdef GL_VERSION_4_3
+// KHR_debug constant portability for GLES 3.1
+#if defined(HL_GLES31) && !defined(GL_DEBUG_OUTPUT)
+#define GL_DEBUG_OUTPUT                GL_DEBUG_OUTPUT_KHR
+#define GL_DEBUG_OUTPUT_SYNCHRONOUS    GL_DEBUG_OUTPUT_SYNCHRONOUS_KHR
+#define GL_DEBUG_SOURCE_APPLICATION    GL_DEBUG_SOURCE_APPLICATION_KHR
+#define GL_DEBUG_TYPE_MARKER           GL_DEBUG_TYPE_MARKER_KHR
+#define GL_DEBUG_SEVERITY_NOTIFICATION GL_DEBUG_SEVERITY_NOTIFICATION_KHR
+#define GL_DEBUG_TYPE_PERFORMANCE      GL_DEBUG_TYPE_PERFORMANCE_KHR
+#define GL_DEBUG_TYPE_OTHER            GL_DEBUG_TYPE_OTHER_KHR
+#define GL_DEBUG_TYPE_ERROR            GL_DEBUG_TYPE_ERROR_KHR
+#endif
+
+// GLES 3.1 KHR_debug function pointers (loaded at runtime)
+#if defined(HL_GLES31)
+static PFNGLPUSHDEBUGGROUPKHRPROC _glPushDebugGroup = NULL;
+static PFNGLPOPDEBUGGROUPKHRPROC _glPopDebugGroup = NULL;
+static PFNGLOBJECTLABELKHRPROC _glObjectLabel = NULL;
+static PFNGLDEBUGMESSAGEINSERTKHRPROC _glDebugMessageInsert = NULL;
+static PFNGLDEBUGMESSAGECONTROLKHRPROC _glDebugMessageControl = NULL;
+static PFNGLDEBUGMESSAGECALLBACKKHRPROC _glDebugMessageCallback = NULL;
+#endif
+
+static bool gl_debug_enabled = false;
+
+#if defined(HL_GLES)
+static void GL_APIENTRY debug_message_callback( GLenum source, GLenum type, GLuint id, GLenum severity, GLsizei length, const GLchar* message, const void* userParam ) {
+#else
 static void APIENTRY debug_message_callback( GLenum source, GLenum type, GLuint id, GLenum severity, GLsizei length, const GLchar* message, const void* userParam ) {
+#endif
 	fprintf(stderr, "GL %s: type = 0x%x, severity = 0x%x, message = %s\n",
 		( type == GL_DEBUG_TYPE_ERROR ? "** ERROR **" : "DEBUG" ),
 		type, severity, message);
 }
-#endif
 
 #define ZIDX(val) ((val)?(val)->v.i:0)
-
-// Debug logging - set to 0 to disable
-#define GL_DEBUG_LOG 0
-
-#if GL_DEBUG_LOG
-static int gl_debug_frame_count = 0;
-static int gl_debug_call_count = 0;
-
-#define GL_CHECK_ERROR(name) do { \
-	GLenum err = glGetError(); \
-	if (err != GL_NO_ERROR) { \
-		fprintf(stderr, "[GL ERROR] %s: 0x%04X\n", name, err); \
-	} \
-} while(0)
-
-#define GL_LOG(fmt, ...) fprintf(stderr, "[GL] " fmt "\n", ##__VA_ARGS__)
-#define GL_LOG_TEX(fmt, ...) fprintf(stderr, "[GL TEX] " fmt "\n", ##__VA_ARGS__)
-#else
-#define GL_CHECK_ERROR(name)
-#define GL_LOG(fmt, ...)
-#define GL_LOG_TEX(fmt, ...)
-#endif
-
-// Shader debug - print shaders when HL_SHADER_DEBUG=1
-static int shader_debug_enabled = -1;
 
 // globals
 HL_PRIM bool HL_NAME(gl_init)() {
@@ -143,18 +144,83 @@ HL_PRIM bool HL_NAME(gl_init)() {
 }
 
 HL_PRIM bool HL_NAME(gl_set_debug)( bool enable ) {
-#ifdef GL_VERSION_4_3
 	if( enable ) {
+#if defined(HL_GLES31)
+		// GLES 3.1: load KHR_debug functions at runtime
+		_glPushDebugGroup = (PFNGLPUSHDEBUGGROUPKHRPROC)SDL_GL_GetProcAddress("glPushDebugGroupKHR");
+		_glPopDebugGroup = (PFNGLPOPDEBUGGROUPKHRPROC)SDL_GL_GetProcAddress("glPopDebugGroupKHR");
+		_glObjectLabel = (PFNGLOBJECTLABELKHRPROC)SDL_GL_GetProcAddress("glObjectLabelKHR");
+		_glDebugMessageInsert = (PFNGLDEBUGMESSAGEINSERTKHRPROC)SDL_GL_GetProcAddress("glDebugMessageInsertKHR");
+		_glDebugMessageControl = (PFNGLDEBUGMESSAGECONTROLKHRPROC)SDL_GL_GetProcAddress("glDebugMessageControlKHR");
+		_glDebugMessageCallback = (PFNGLDEBUGMESSAGECALLBACKKHRPROC)SDL_GL_GetProcAddress("glDebugMessageCallbackKHR");
+		if( !_glDebugMessageCallback ) {
+			gl_debug_enabled = false;
+			return false;
+		}
 		glEnable(GL_DEBUG_OUTPUT);
+		glEnable(GL_DEBUG_OUTPUT_SYNCHRONOUS);
+		_glDebugMessageControl(GL_DONT_CARE, GL_DEBUG_TYPE_PERFORMANCE, GL_DONT_CARE, 0, NULL, GL_FALSE);
+		_glDebugMessageControl(GL_DONT_CARE, GL_DEBUG_TYPE_OTHER, GL_DONT_CARE, 0, NULL, GL_FALSE);
+		_glDebugMessageCallback(debug_message_callback, 0);
+#elif defined(GL_VERSION_4_3) || defined(HL_ANDROID)
+		glEnable(GL_DEBUG_OUTPUT);
+		glEnable(GL_DEBUG_OUTPUT_SYNCHRONOUS);
 		glDebugMessageControl(GL_DONT_CARE, GL_DEBUG_TYPE_PERFORMANCE, GL_DONT_CARE, 0, NULL, GL_FALSE);
 		glDebugMessageControl(GL_DONT_CARE, GL_DEBUG_TYPE_OTHER, GL_DONT_CARE, 0, NULL, GL_FALSE);
 		glDebugMessageCallback(debug_message_callback, 0);
+#else
+		return false;
+#endif
+		gl_debug_enabled = true;
 	} else {
+#if defined(HL_GLES31) || defined(GL_VERSION_4_3) || defined(HL_ANDROID)
 		glDisable(GL_DEBUG_OUTPUT);
+#endif
+		gl_debug_enabled = false;
 	}
 	return true;
-#else
-	return false;
+}
+
+HL_PRIM void HL_NAME(gl_push_debug_group)( vstring *label ) {
+	if( !gl_debug_enabled ) return;
+	const char *utf8 = hl_to_utf8(label->bytes);
+#if defined(HL_GLES31)
+	if( _glPushDebugGroup )
+		_glPushDebugGroup(GL_DEBUG_SOURCE_APPLICATION, 0, -1, utf8);
+#elif defined(GL_VERSION_4_3) || defined(HL_ANDROID)
+	glPushDebugGroup(GL_DEBUG_SOURCE_APPLICATION, 0, -1, utf8);
+#endif
+}
+
+HL_PRIM void HL_NAME(gl_pop_debug_group)() {
+	if( !gl_debug_enabled ) return;
+#if defined(HL_GLES31)
+	if( _glPopDebugGroup )
+		_glPopDebugGroup();
+#elif defined(GL_VERSION_4_3) || defined(HL_ANDROID)
+	glPopDebugGroup();
+#endif
+}
+
+HL_PRIM void HL_NAME(gl_debug_message_insert)( vstring *message ) {
+	if( !gl_debug_enabled ) return;
+	const char *utf8 = hl_to_utf8(message->bytes);
+#if defined(HL_GLES31)
+	if( _glDebugMessageInsert )
+		_glDebugMessageInsert(GL_DEBUG_SOURCE_APPLICATION, GL_DEBUG_TYPE_MARKER, 0, GL_DEBUG_SEVERITY_NOTIFICATION, -1, utf8);
+#elif defined(GL_VERSION_4_3) || defined(HL_ANDROID)
+	glDebugMessageInsert(GL_DEBUG_SOURCE_APPLICATION, GL_DEBUG_TYPE_MARKER, 0, GL_DEBUG_SEVERITY_NOTIFICATION, -1, utf8);
+#endif
+}
+
+HL_PRIM void HL_NAME(gl_object_label)( int identifier, vdynamic *obj, vstring *label ) {
+	if( !gl_debug_enabled ) return;
+	const char *utf8 = hl_to_utf8(label->bytes);
+#if defined(HL_GLES31)
+	if( _glObjectLabel )
+		_glObjectLabel(identifier, ZIDX(obj), -1, utf8);
+#elif defined(GL_VERSION_4_3) || defined(HL_ANDROID)
+	glObjectLabel(identifier, ZIDX(obj), -1, utf8);
 #endif
 }
 
@@ -335,7 +401,6 @@ HL_PRIM void HL_NAME(gl_attach_shader)( vdynamic *p, vdynamic *s ) {
 
 HL_PRIM void HL_NAME(gl_link_program)( vdynamic *p ) {
 	GL_ENSURE_CONTEXT();
-	GL_LOG("glLinkProgram(%d)", p->v.i);
 	glLinkProgram(p->v.i);
 	int status = 0;
 	glGetProgramiv(p->v.i, 0x8B82/*GL_LINK_STATUS*/, &status);
@@ -344,7 +409,6 @@ HL_PRIM void HL_NAME(gl_link_program)( vdynamic *p ) {
 		glGetProgramInfoLog(p->v.i, sizeof(log), NULL, log);
 		fprintf(stderr, "[GL ERROR] Program %d link failed: %s\n", p->v.i, log);
 	}
-	GL_CHECK_ERROR("glLinkProgram");
 }
 
 HL_PRIM vdynamic *HL_NAME(gl_get_program_parameter)( vdynamic *p, int param ) {
@@ -400,28 +464,11 @@ HL_PRIM vdynamic *HL_NAME(gl_create_shader)( int type ) {
 HL_PRIM void HL_NAME(gl_shader_source)( vdynamic *s, vstring *src ) {
 	GL_ENSURE_CONTEXT();
 	const GLchar *c = (GLchar*)hl_to_utf8(src->bytes);
-	if (shader_debug_enabled < 0) {
-		const char *env = getenv("HL_SHADER_DEBUG");
-		shader_debug_enabled = (env && env[0] == '1');
-	}
-	if (shader_debug_enabled) {
-		int type = 0;
-		glGetShaderiv(s->v.i, 0x8B4F/*GL_SHADER_TYPE*/, &type);
-		const char *type_name = "unknown";
-		switch (type) {
-			case 0x8B31: type_name = "vertex"; break;
-			case 0x8B30: type_name = "fragment"; break;
-			case 0x91B9: type_name = "compute"; break;
-			case 0x8DD9: type_name = "geometry"; break;
-		}
-		fprintf(stderr, "=== Shader %d (%s) ===\n%s\n================\n", s->v.i, type_name, c);
-	}
 	glShaderSource(s->v.i, 1, &c, NULL);
 }
 
 HL_PRIM void HL_NAME(gl_compile_shader)( vdynamic *s ) {
 	GL_ENSURE_CONTEXT();
-	GL_LOG("glCompileShader(%d)", s->v.i);
 	glCompileShader(s->v.i);
 	int status = 0;
 	glGetShaderiv(s->v.i, 0x8B81/*GL_COMPILE_STATUS*/, &status);
@@ -430,7 +477,6 @@ HL_PRIM void HL_NAME(gl_compile_shader)( vdynamic *s ) {
 		glGetShaderInfoLog(s->v.i, sizeof(log), NULL, log);
 		fprintf(stderr, "[GL ERROR] Shader %d compile failed: %s\n", s->v.i, log);
 	}
-	GL_CHECK_ERROR("glCompileShader");
 }
 
 HL_PRIM vbyte *HL_NAME(gl_get_shader_info_bytes)( vdynamic *s ) {
@@ -469,22 +515,17 @@ HL_PRIM vdynamic *HL_NAME(gl_create_texture)() {
 	GL_ENSURE_CONTEXT();
 	unsigned int t = 0;
 	glGenTextures(1, &t);
-	GL_LOG_TEX("glGenTextures -> %u", t);
-	GL_CHECK_ERROR("glGenTextures");
 	return alloc_i32(t);
 }
 
 HL_PRIM void HL_NAME(gl_active_texture)( int t ) {
 	GL_ENSURE_CONTEXT();
-	GL_LOG_TEX("glActiveTexture(0x%04X) [unit %d]", t, t - 0x84C0);
 	glActiveTexture(t);
 }
 
 HL_PRIM void HL_NAME(gl_bind_texture)( int t, vdynamic *texture ) {
 	GL_ENSURE_CONTEXT();
-	GL_LOG_TEX("glBindTexture(target=0x%04X, tex=%d)", t, ZIDX(texture));
 	glBindTexture(t, ZIDX(texture));
-	GL_CHECK_ERROR("glBindTexture");
 }
 
 HL_PRIM void HL_NAME(gl_bind_image_texture)( int unit, int texture, int level, bool layered, int layer, int access, int format ) {
@@ -504,27 +545,18 @@ HL_PRIM void HL_NAME(gl_tex_parameteri)( int t, int key, int value ) {
 
 HL_PRIM void HL_NAME(gl_tex_image2d)( int target, int level, int internalFormat, int width, int height, int border, int format, int type, vbyte *image ) {
 	GL_ENSURE_CONTEXT();
-	GL_LOG_TEX("glTexImage2D(target=0x%04X, level=%d, internalFmt=0x%04X, %dx%d, fmt=0x%04X, type=0x%04X, data=%p)",
-		target, level, internalFormat, width, height, format, type, (void*)image);
 	glTexImage2D(target, level, internalFormat, width, height, border, format, type, image);
-	GL_CHECK_ERROR("glTexImage2D");
 }
 
 HL_PRIM void HL_NAME(gl_tex_image3d)( int target, int level, int internalFormat, int width, int height, int depth, int border, int format, int type, vbyte *image ) {
 	GL_ENSURE_CONTEXT();
-	GL_LOG_TEX("glTexImage3D(target=0x%04X, level=%d, internalFmt=0x%04X, %dx%dx%d, fmt=0x%04X, type=0x%04X, data=%p)",
-		target, level, internalFormat, width, height, depth, format, type, (void*)image);
 	glTexImage3D(target, level, internalFormat, width, height, depth, border, format, type, image);
-	GL_CHECK_ERROR("glTexImage3D");
 }
 
 HL_PRIM void HL_NAME(gl_tex_storage2d)( int target, int levels, int internalFormat, int width, int height) {
 	GL_ENSURE_CONTEXT();
 #ifndef __APPLE__
-	GL_LOG_TEX("glTexStorage2D(target=0x%04X, levels=%d, internalFmt=0x%04X, %dx%d)",
-		target, levels, internalFormat, width, height);
 	glTexStorage2D(target, levels, internalFormat, width, height);
-	GL_CHECK_ERROR("glTexStorage2D");
 #else
     hl_error("glTexStorage2d is not supported on Apple platforms");
 #endif
@@ -533,10 +565,7 @@ HL_PRIM void HL_NAME(gl_tex_storage2d)( int target, int levels, int internalForm
 HL_PRIM void HL_NAME(gl_tex_storage3d)( int target, int levels, int internalFormat, int width, int height, int depth) {
 	GL_ENSURE_CONTEXT();
 #ifndef __APPLE__
-	GL_LOG_TEX("glTexStorage3D(target=0x%04X, levels=%d, internalFmt=0x%04X, %dx%dx%d)",
-		target, levels, internalFormat, width, height, depth);
 	glTexStorage3D(target, levels, internalFormat, width, height, depth);
-	GL_CHECK_ERROR("glTexStorage3D");
 #else
 	hl_error("glTexStorage3d is not supported on Apple platforms");
 #endif
@@ -549,57 +578,37 @@ HL_PRIM void HL_NAME(gl_tex_image2d_multisample)( int target, int samples, int i
 
 HL_PRIM void HL_NAME(gl_compressed_tex_image2d)( int target, int level, int internalFormat, int width, int height, int border, int imageSize, vbyte *image ) {
 	GL_ENSURE_CONTEXT();
-	GL_LOG_TEX("glCompressedTexImage2D(target=0x%04X, level=%d, internalFmt=0x%04X, %dx%d, size=%d, data=%p)",
-		target, level, internalFormat, width, height, imageSize, (void*)image);
 	glCompressedTexImage2D(target,level,internalFormat,width,height,border,imageSize,image);
-	GL_CHECK_ERROR("glCompressedTexImage2D");
 }
 
 HL_PRIM void HL_NAME(gl_compressed_tex_image3d)( int target, int level, int internalFormat, int width, int height, int depth, int border, int imageSize, vbyte *image ) {
 	GL_ENSURE_CONTEXT();
-	GL_LOG_TEX("glCompressedTexImage3D(target=0x%04X, level=%d, internalFmt=0x%04X, %dx%dx%d, size=%d, data=%p)",
-		target, level, internalFormat, width, height, depth, imageSize, (void*)image);
 	glCompressedTexImage3D(target,level,internalFormat,width,height,depth,border,imageSize,image);
-	GL_CHECK_ERROR("glCompressedTexImage3D");
 }
 
 HL_PRIM void HL_NAME(gl_tex_sub_image2d)(int target, int level, int xoffset, int yoffset, int width, int height, int format, int type, vbyte *image) {
 	GL_ENSURE_CONTEXT();
-	GL_LOG_TEX("glTexSubImage2D(target=0x%04X, level=%d, offset=%d,%d, %dx%d, fmt=0x%04X, type=0x%04X, data=%p)",
-		target, level, xoffset, yoffset, width, height, format, type, (void*)image);
 	glTexSubImage2D(target, level, xoffset, yoffset, width, height, format, type, image);
-	GL_CHECK_ERROR("glTexSubImage2D");
 }
 
 HL_PRIM void HL_NAME(gl_tex_sub_image3d)(int target, int level, int xoffset, int yoffset, int zoffset, int width, int height, int depth, int format, int type, vbyte *image) {
 	GL_ENSURE_CONTEXT();
-	GL_LOG_TEX("glTexSubImage3D(target=0x%04X, level=%d, offset=%d,%d,%d, %dx%dx%d, fmt=0x%04X, type=0x%04X, data=%p)",
-		target, level, xoffset, yoffset, zoffset, width, height, depth, format, type, (void*)image);
 	glTexSubImage3D(target, level, xoffset, yoffset, zoffset, width, height, depth, format, type, image);
-	GL_CHECK_ERROR("glTexSubImage3D");
 }
 
 HL_PRIM void HL_NAME(gl_compressed_tex_sub_image2d)(int target, int level, int xoffset, int yoffset, int width, int height, int format, int type, vbyte *image) {
 	GL_ENSURE_CONTEXT();
-	GL_LOG_TEX("glCompressedTexSubImage2D(target=0x%04X, level=%d, offset=%d,%d, %dx%d, fmt=0x%04X, size=%d, data=%p)",
-		target, level, xoffset, yoffset, width, height, format, type, (void*)image);
 	glCompressedTexSubImage2D(target, level, xoffset, yoffset, width, height, format, type, image);
-	GL_CHECK_ERROR("glCompressedTexSubImage2D");
 }
 
 HL_PRIM void HL_NAME(gl_compressed_tex_sub_image3d)(int target, int level, int xoffset, int yoffset, int zoffset, int width, int height, int depth, int format, int type, vbyte *image) {
 	GL_ENSURE_CONTEXT();
-	GL_LOG_TEX("glCompressedTexSubImage3D(target=0x%04X, level=%d, offset=%d,%d,%d, %dx%dx%d, fmt=0x%04X, size=%d, data=%p)",
-		target, level, xoffset, yoffset, zoffset, width, height, depth, format, type, (void*)image);
 	glCompressedTexSubImage3D(target, level, xoffset, yoffset, zoffset, width, height, depth, format, type, image);
-	GL_CHECK_ERROR("glCompressedTexSubImage3D");
 }
 
 HL_PRIM void HL_NAME(gl_generate_mipmap)( int t ) {
 	GL_ENSURE_CONTEXT();
-	GL_LOG_TEX("glGenerateMipmap(target=0x%04X)", t);
 	glGenerateMipmap(t);
-	GL_CHECK_ERROR("glGenerateMipmap");
 }
 
 HL_PRIM void HL_NAME(gl_delete_texture)( vdynamic *t ) {
@@ -619,7 +628,6 @@ HL_PRIM vdynamic *HL_NAME(gl_create_framebuffer)() {
 	GL_ENSURE_CONTEXT();
 	unsigned int f = 0;
 	glGenFramebuffers(1, &f);
-	GL_LOG("glGenFramebuffers -> %u", f);
 	return alloc_i32(f);
 }
 
@@ -634,44 +642,26 @@ HL_PRIM void HL_NAME(gl_bind_framebuffer)( int target, vdynamic *f ) {
 		id = info.info.uikit.framebuffer;
 	}
 #endif
-	GL_LOG("glBindFramebuffer(target=0x%04X, fb=%u)", target, id);
 	glBindFramebuffer(target, id);
-#if GL_DEBUG_LOG
-	if (id != 0) {
-		GLenum status = glCheckFramebufferStatus(target);
-		if (status != GL_FRAMEBUFFER_COMPLETE) {
-			fprintf(stderr, "[GL ERROR] Framebuffer %u incomplete: 0x%04X\n", id, status);
-		}
-	}
-#endif
 }
 
 HL_PRIM void HL_NAME(gl_framebuffer_texture)( int target, int attach, vdynamic *t, int level ) {
 	GL_ENSURE_CONTEXT();
-	GL_LOG("glFramebufferTexture(target=0x%04X, attach=0x%04X, tex=%d, level=%d)", target, attach, ZIDX(t), level);
 #if defined(HL_GLES31)
-	// GLES 3.1 doesn't have glFramebufferTexture, use glFramebufferTexture2D for 2D textures
-	// This assumes the texture is GL_TEXTURE_2D which is the common case
 	glFramebufferTexture2D(target, attach, GL_TEXTURE_2D, ZIDX(t), level);
-	GL_CHECK_ERROR("glFramebufferTexture2D (GLES31 fallback)");
 #else
 	glFramebufferTexture(target, attach, ZIDX(t), level);
-	GL_CHECK_ERROR("glFramebufferTexture");
 #endif
 }
 
 HL_PRIM void HL_NAME(gl_framebuffer_texture2d)( int target, int attach, int texTarget, vdynamic *t, int level ) {
 	GL_ENSURE_CONTEXT();
-	GL_LOG("glFramebufferTexture2D(target=0x%04X, attach=0x%04X, texTarget=0x%04X, tex=%d, level=%d)", target, attach, texTarget, ZIDX(t), level);
 	glFramebufferTexture2D(target, attach, texTarget, ZIDX(t), level);
-	GL_CHECK_ERROR("glFramebufferTexture2D");
 }
 
 HL_PRIM void HL_NAME(gl_framebuffer_texture_layer)( int target, int attach, vdynamic *t, int level, int layer ) {
 	GL_ENSURE_CONTEXT();
-	GL_LOG("glFramebufferTextureLayer(target=0x%04X, attach=0x%04X, tex=%d, level=%d, layer=%d)", target, attach, ZIDX(t), level, layer);
 	glFramebufferTextureLayer(target, attach, ZIDX(t), level, layer);
-	GL_CHECK_ERROR("glFramebufferTextureLayer");
 }
 
 HL_PRIM void HL_NAME(gl_delete_framebuffer)( vdynamic *f ) {
@@ -701,7 +691,6 @@ HL_PRIM vdynamic *HL_NAME(gl_create_renderbuffer)() {
 	GL_ENSURE_CONTEXT();
 	unsigned int buf = 0;
 	glGenRenderbuffers(1, &buf);
-	GL_LOG("glGenRenderbuffers -> %u", buf);
 	return alloc_i32(buf);
 }
 
@@ -725,20 +714,12 @@ HL_PRIM void HL_NAME(gl_renderbuffer_storage)( int target, int format, int width
 	// GLES requires sized internal formats - translate unsized ones
 	if (format == GL_DEPTH_STENCIL) {
 		format = GL_DEPTH24_STENCIL8;
-		GL_LOG("glRenderbufferStorage(target=0x%04X, format=0x%04X [translated from GL_DEPTH_STENCIL], %dx%d)", target, format, width, height);
 	} else if (format == GL_DEPTH_COMPONENT) {
 		format = GL_DEPTH_COMPONENT24;
-		GL_LOG("glRenderbufferStorage(target=0x%04X, format=0x%04X [translated from GL_DEPTH_COMPONENT], %dx%d)", target, format, width, height);
-	} else {
-		GL_LOG("glRenderbufferStorage(target=0x%04X, format=0x%04X, %dx%d)", target, format, width, height);
 	}
-#else
-	GL_LOG("glRenderbufferStorage(target=0x%04X, format=0x%04X, %dx%d)", target, format, width, height);
 #endif
 	glRenderbufferStorage(target, format, width, height);
-	GL_CHECK_ERROR("glRenderbufferStorage");
 }
-
 
 HL_PRIM void HL_NAME(gl_renderbuffer_storage_multisample)( int target, int samples, int format, int width, int height ) {
 	GL_ENSURE_CONTEXT();
@@ -750,16 +731,12 @@ HL_PRIM void HL_NAME(gl_renderbuffer_storage_multisample)( int target, int sampl
 		format = GL_DEPTH_COMPONENT24;
 	}
 #endif
-	GL_LOG("glRenderbufferStorageMultisample(target=0x%04X, samples=%d, format=0x%04X, %dx%d)", target, samples, format, width, height);
 	glRenderbufferStorageMultisample(target, samples, format, width, height);
-	GL_CHECK_ERROR("glRenderbufferStorageMultisample");
 }
 
 HL_PRIM void HL_NAME(gl_framebuffer_renderbuffer)( int frameTarget, int attach, int renderTarget, vdynamic *b ) {
 	GL_ENSURE_CONTEXT();
-	GL_LOG("glFramebufferRenderbuffer(target=0x%04X, attach=0x%04X, rb=%d)", frameTarget, attach, ZIDX(b));
 	glFramebufferRenderbuffer(frameTarget, attach, renderTarget, ZIDX(b));
-	GL_CHECK_ERROR("glFramebufferRenderbuffer");
 }
 
 HL_PRIM void HL_NAME(gl_delete_renderbuffer)( vdynamic *b ) {
@@ -871,34 +848,21 @@ HL_PRIM void HL_NAME(gl_memory_barrier)( int barriers ) {
 HL_PRIM void HL_NAME(gl_draw_elements)( int mode, int count, int type, int start ) {
 	GL_ENSURE_CONTEXT();
 	glDrawElements(mode, count, type, (void*)(int_val)start);
-#if GL_DEBUG_LOG
-	gl_debug_call_count++;
-	GLenum err = glGetError();
-	if (err != GL_NO_ERROR) {
-		fprintf(stderr, "[GL ERROR] glDrawElements(mode=0x%04X, count=%d): 0x%04X\n", mode, count, err);
-	}
-	if ((gl_debug_call_count % 1000) == 0) {
-		GL_LOG("glDrawElements [call #%d]", gl_debug_call_count);
-	}
-#endif
 }
 
 HL_PRIM void HL_NAME(gl_draw_arrays)( int mode, int first, int count, int start ) {
 	GL_ENSURE_CONTEXT();
 	glDrawArrays(mode,first,count);
-	GL_CHECK_ERROR("glDrawArrays");
 }
 
 HL_PRIM void HL_NAME(gl_draw_elements_instanced)( int mode, int count, int type, int start, int primcount ) {
 	GL_ENSURE_CONTEXT();
 	glDrawElementsInstanced(mode,count,type,(void*)(int_val)start,primcount);
-	GL_CHECK_ERROR("glDrawElementsInstanced");
 }
 
 HL_PRIM void HL_NAME(gl_draw_arrays_instanced)( int mode, int first, int count, int primcount ) {
 	GL_ENSURE_CONTEXT();
 	glDrawArraysInstanced(mode,first,count,primcount);
-	GL_CHECK_ERROR("glDrawArraysInstanced");
 }
 
 HL_PRIM void HL_NAME(gl_multi_draw_elements_indirect)( int mode, int type, vbyte *data, int count, int stride ) {
@@ -1172,5 +1136,9 @@ DEFINE_PRIM(_VOID, gl_uniform_block_binding, _NULL(_I32) _I32 _I32);
 DEFINE_PRIM(_I32, gl_get_program_resource_index, _NULL(_I32) _I32 _STRING);
 DEFINE_PRIM(_VOID, gl_shader_storage_block_binding, _NULL(_I32) _I32 _I32);
 
+DEFINE_PRIM(_VOID, gl_push_debug_group, _STRING);
+DEFINE_PRIM(_VOID, gl_pop_debug_group, _NO_ARG);
+DEFINE_PRIM(_VOID, gl_debug_message_insert, _STRING);
+DEFINE_PRIM(_VOID, gl_object_label, _I32 _NULL(_I32) _STRING);
 DEFINE_PRIM(_I32, gl_get_config_parameter, _I32);
 DEFINE_PRIM(_BOOL, gl_has_extension, _STRING);
