@@ -112,6 +112,8 @@ static int GLLoadAPI() {
 #define GL_DEBUG_TYPE_PERFORMANCE      GL_DEBUG_TYPE_PERFORMANCE_KHR
 #define GL_DEBUG_TYPE_OTHER            GL_DEBUG_TYPE_OTHER_KHR
 #define GL_DEBUG_TYPE_ERROR            GL_DEBUG_TYPE_ERROR_KHR
+#define GL_DEBUG_TYPE_PUSH_GROUP       GL_DEBUG_TYPE_PUSH_GROUP_KHR
+#define GL_DEBUG_TYPE_POP_GROUP        GL_DEBUG_TYPE_POP_GROUP_KHR
 #endif
 
 // GLES 3.1 KHR_debug function pointers (loaded at runtime)
@@ -161,12 +163,16 @@ HL_PRIM bool HL_NAME(gl_set_debug)( bool enable ) {
 		glEnable(GL_DEBUG_OUTPUT_SYNCHRONOUS);
 		_glDebugMessageControl(GL_DONT_CARE, GL_DEBUG_TYPE_PERFORMANCE, GL_DONT_CARE, 0, NULL, GL_FALSE);
 		_glDebugMessageControl(GL_DONT_CARE, GL_DEBUG_TYPE_OTHER, GL_DONT_CARE, 0, NULL, GL_FALSE);
+		_glDebugMessageControl(GL_DONT_CARE, GL_DEBUG_TYPE_PUSH_GROUP, GL_DONT_CARE, 0, NULL, GL_FALSE);
+		_glDebugMessageControl(GL_DONT_CARE, GL_DEBUG_TYPE_POP_GROUP, GL_DONT_CARE, 0, NULL, GL_FALSE);
 		_glDebugMessageCallback(debug_message_callback, 0);
 #elif defined(GL_VERSION_4_3) || defined(HL_ANDROID)
 		glEnable(GL_DEBUG_OUTPUT);
 		glEnable(GL_DEBUG_OUTPUT_SYNCHRONOUS);
 		glDebugMessageControl(GL_DONT_CARE, GL_DEBUG_TYPE_PERFORMANCE, GL_DONT_CARE, 0, NULL, GL_FALSE);
 		glDebugMessageControl(GL_DONT_CARE, GL_DEBUG_TYPE_OTHER, GL_DONT_CARE, 0, NULL, GL_FALSE);
+		glDebugMessageControl(GL_DONT_CARE, GL_DEBUG_TYPE_PUSH_GROUP, GL_DONT_CARE, 0, NULL, GL_FALSE);
+		glDebugMessageControl(GL_DONT_CARE, GL_DEBUG_TYPE_POP_GROUP, GL_DONT_CARE, 0, NULL, GL_FALSE);
 		glDebugMessageCallback(debug_message_callback, 0);
 #else
 		return false;
