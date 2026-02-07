@@ -44,6 +44,8 @@
  *   --rss          Report memory usage (RSS) per batch
  *   --batch        Batched compilation (~200 functions/batch)
  *   --batch-size=N Custom batch size
+ *   --link         Link object files into executable (requires --batch)
+ *   -L <dir>       Add library search path (for --link)
  *   --help         Show this help
  */
 
@@ -54,7 +56,12 @@
 #include <sys/stat.h>
 #include <libgen.h>
 #include <errno.h>
+#include <unistd.h>
 #include "llvm_codegen.h"
+
+/* From llvm_link.cpp — LLD-based ELF linker */
+extern int llvm_lld_link_elf(const char *manifest_path, const char *output_path,
+                             const char *lib_dirs, int verbose);
 
 /* Get current RSS in KB from /proc/self/status */
 static long get_rss_kb(void) {
@@ -95,6 +102,8 @@ static void print_usage(const char *prog) {
     printf("  --rss          Report memory usage (RSS) per batch\n");
     printf("  --batch        Batched compilation (~200 functions/batch)\n");
     printf("  --batch-size=N Custom batch size (minimum 10)\n");
+    printf("  --link         Link object files into executable (requires --batch)\n");
+    printf("  -L <dir>       Add library search path (for --link)\n");
     printf("  --help         Show this help\n");
 }
 
@@ -109,18 +118,23 @@ int main(int argc, char **argv) {
     int batch_size = 0;  /* 0 = single file, >0 = batched mode */
     int inline_threshold = 0;  /* 0 = use LLVM default */
     int fast_math = 0;         /* 0=off, 1=safe, 2=full */
+    bool do_link = false;
     const char *target_cpu = NULL;
     const char *target_features = NULL;
+    /* Library search paths for --link (colon-separated) */
+    char lib_dirs[4096] = "";
+    int lib_dirs_len = 0;
 
     /* Parse command line arguments */
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             print_usage(argv[0]);
-            return 0;
+            fflush(stdout);
+            _exit(0);
         } else if (strcmp(argv[i], "-o") == 0) {
             if (i + 1 >= argc) {
                 fprintf(stderr, "Error: -o requires an argument\n");
-                return 1;
+                _exit(1);
             }
             output_file = argv[++i];
         } else if (strcmp(argv[i], "--emit-llvm") == 0) {
@@ -162,13 +176,38 @@ int main(int argc, char **argv) {
             target_cpu = argv[i] + 7;
         } else if (strncmp(argv[i], "--mattr=", 8) == 0) {
             target_features = argv[i] + 8;
+        } else if (strcmp(argv[i], "--link") == 0) {
+            do_link = true;
+        } else if (strcmp(argv[i], "-L") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Error: -L requires an argument\n");
+                _exit(1);
+            }
+            const char *dir = argv[++i];
+            if (lib_dirs_len > 0) {
+                lib_dirs[lib_dirs_len++] = ':';
+            }
+            int dlen = strlen(dir);
+            memcpy(lib_dirs + lib_dirs_len, dir, dlen);
+            lib_dirs_len += dlen;
+            lib_dirs[lib_dirs_len] = '\0';
+        } else if (strncmp(argv[i], "-L", 2) == 0 && argv[i][2] != '\0') {
+            /* -L/path/to/dir (no space) */
+            const char *dir = argv[i] + 2;
+            if (lib_dirs_len > 0) {
+                lib_dirs[lib_dirs_len++] = ':';
+            }
+            int dlen = strlen(dir);
+            memcpy(lib_dirs + lib_dirs_len, dir, dlen);
+            lib_dirs_len += dlen;
+            lib_dirs[lib_dirs_len] = '\0';
         } else if (argv[i][0] == '-') {
             fprintf(stderr, "Unknown option: %s\n", argv[i]);
-            return 1;
+            _exit(1);
         } else {
             if (input_file != NULL) {
                 fprintf(stderr, "Error: Multiple input files specified\n");
-                return 1;
+                _exit(1);
             }
             input_file = argv[i];
         }
@@ -177,12 +216,17 @@ int main(int argc, char **argv) {
     if (input_file == NULL) {
         fprintf(stderr, "Error: No input file specified\n");
         print_usage(argv[0]);
-        return 1;
+        _exit(1);
     }
 
     if (output_file == NULL) {
         fprintf(stderr, "Error: No output file specified (use -o)\n");
-        return 1;
+        _exit(1);
+    }
+
+    if (do_link && batch_size == 0) {
+        fprintf(stderr, "Error: --link requires --batch mode\n");
+        _exit(1);
     }
 
     /* Initialize HashLink runtime (needed for hl_code_read) */
@@ -196,7 +240,7 @@ int main(int argc, char **argv) {
     FILE *f = fopen(input_file, "rb");
     if (!f) {
         fprintf(stderr, "Error: Cannot open file %s\n", input_file);
-        return 1;
+        _exit(1);
     }
 
     fseek(f, 0, SEEK_END);
@@ -207,14 +251,14 @@ int main(int argc, char **argv) {
     if (!fdata) {
         fprintf(stderr, "Error: Out of memory\n");
         fclose(f);
-        return 1;
+        _exit(1);
     }
 
     if (fread(fdata, 1, size, f) != (size_t)size) {
         fprintf(stderr, "Error: Failed to read %s\n", input_file);
         free(fdata);
         fclose(f);
-        return 1;
+        _exit(1);
     }
     fclose(f);
 
@@ -226,7 +270,7 @@ int main(int argc, char **argv) {
         free(fdata);
         fprintf(stderr, "Error: Failed to load %s: %s\n", input_file,
                 error_msg ? error_msg : "unknown error");
-        return 1;
+        _exit(1);
     }
 
     if (verbose) {
@@ -302,7 +346,7 @@ int main(int argc, char **argv) {
             free(module_ctx.functions_types);
             free(fdata);
             hl_code_free(code);
-            return 1;
+            _exit(1);
         }
 
         /* Create manifest file */
@@ -315,7 +359,7 @@ int main(int argc, char **argv) {
             free(module_ctx.functions_types);
             free(fdata);
             hl_code_free(code);
-            return 1;
+            _exit(1);
         }
         fprintf(manifest, "# hl2llvm batch compilation manifest\n");
         fprintf(manifest, "# Link with: clang @%s -lhl -o output\n", manifest_path);
@@ -335,7 +379,7 @@ int main(int argc, char **argv) {
                 free(module_ctx.functions_types);
                 free(fdata);
                 hl_code_free(code);
-                return 1;
+                _exit(1);
             }
 
             ctx->opt_level = opt_level;
@@ -382,7 +426,7 @@ int main(int argc, char **argv) {
                 free(module_ctx.functions_types);
                 free(fdata);
                 hl_code_free(code);
-                return 1;
+                _exit(1);
             }
 
             if (ctx->batch_mode != LLVM_BATCH_FINAL) {
@@ -397,7 +441,7 @@ int main(int argc, char **argv) {
                         free(module_ctx.functions_types);
                         free(fdata);
                         hl_code_free(code);
-                        return 1;
+                        _exit(1);
                     }
                 }
             } else {
@@ -411,7 +455,7 @@ int main(int argc, char **argv) {
                     free(module_ctx.functions_types);
                     free(fdata);
                     hl_code_free(code);
-                    return 1;
+                    _exit(1);
                 }
             }
 
@@ -426,7 +470,7 @@ int main(int argc, char **argv) {
                 free(module_ctx.functions_types);
                 free(fdata);
                 hl_code_free(code);
-                return 1;
+                _exit(1);
             }
 
             if (opt_level > LLVM_OPT_NONE) {
@@ -450,7 +494,7 @@ int main(int argc, char **argv) {
                 free(module_ctx.functions_types);
                 free(fdata);
                 hl_code_free(code);
-                return 1;
+                _exit(1);
             }
 
             fprintf(manifest, "%s\n", batch_file);
@@ -470,15 +514,37 @@ int main(int argc, char **argv) {
 
         if (verbose) {
             printf("Batch compilation complete: %d batches + final\n", num_batches);
+        }
+
+        if (do_link) {
+            if (verbose) {
+                printf("Linking %s...\n", output_file);
+            }
+            int link_result = llvm_lld_link_elf(manifest_path, output_file,
+                                                 lib_dirs[0] ? lib_dirs : NULL,
+                                                 verbose);
+            if (link_result != 0) {
+                fprintf(stderr, "Error: Linking failed\n");
+                hl_free(&module_ctx.alloc);
+                free(module_ctx.functions_types);
+                free(fdata);
+                hl_code_free(code);
+                _exit(1);
+            }
+            if (verbose) {
+                printf("Linked: %s\n", output_file);
+            }
+        } else if (verbose) {
             printf("Link with: clang @%s -lhl -o output\n", manifest_path);
         }
 
-        /* Cleanup and exit */
+        /* Cleanup and exit — use _exit() to avoid LLVM/LLD static
+         * destructor double-free when both shared libraries are loaded */
         hl_free(&module_ctx.alloc);
         free(module_ctx.functions_types);
         free(fdata);
         hl_code_free(code);
-        return 0;
+        _exit(0);
     }
 
     /* Single-file compilation mode (original behavior) */
@@ -488,7 +554,7 @@ int main(int argc, char **argv) {
     if (ctx == NULL) {
         fprintf(stderr, "Error: Failed to create LLVM context\n");
         hl_code_free(code);
-        return 1;
+        _exit(1);
     }
 
     ctx->opt_level = opt_level;
@@ -510,7 +576,7 @@ int main(int argc, char **argv) {
                 ctx->error_msg ? ctx->error_msg : "unknown error");
         llvm_destroy_context(ctx);
         hl_code_free(code);
-        return 1;
+        _exit(1);
     }
 
     /* Compile all functions */
@@ -528,7 +594,7 @@ int main(int argc, char **argv) {
                     i, ctx->error_msg ? ctx->error_msg : "unknown error");
             llvm_destroy_context(ctx);
             hl_code_free(code);
-            return 1;
+            _exit(1);
         }
     }
 
@@ -542,7 +608,7 @@ int main(int argc, char **argv) {
                 ctx->error_msg ? ctx->error_msg : "unknown error");
         llvm_destroy_context(ctx);
         hl_code_free(code);
-        return 1;
+        _exit(1);
     }
 
     /* Finalize the module */
@@ -551,7 +617,7 @@ int main(int argc, char **argv) {
                 ctx->error_msg ? ctx->error_msg : "unknown error");
         llvm_destroy_context(ctx);
         hl_code_free(code);
-        return 1;
+        _exit(1);
     }
 
     /* Verify the module */
@@ -564,7 +630,7 @@ int main(int argc, char **argv) {
                 ctx->error_msg ? ctx->error_msg : "unknown error");
         llvm_destroy_context(ctx);
         hl_code_free(code);
-        return 1;
+        _exit(1);
     }
 
     /* Optimize if requested */
@@ -593,7 +659,7 @@ int main(int argc, char **argv) {
                 ctx->error_msg ? ctx->error_msg : "unknown error");
         llvm_destroy_context(ctx);
         hl_code_free(code);
-        return 1;
+        _exit(1);
     }
 
     if (report_rss) {
@@ -607,12 +673,13 @@ int main(int argc, char **argv) {
         printf("Done!\n");
     }
 
-    /* Cleanup */
+    /* Cleanup — use _exit() to avoid LLVM/LLD static destructor
+     * double-free when both shared libraries are loaded */
     llvm_destroy_context(ctx);
     hl_free(&module_ctx.alloc);
     free(module_ctx.functions_types);
     free(fdata);
     hl_code_free(code);
 
-    return 0;
+    _exit(0);
 }

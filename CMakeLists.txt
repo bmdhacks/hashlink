@@ -280,6 +280,7 @@ if(WITH_LLVM_AOT)
         src/llvm/llvm_ops_refs.c
         src/llvm/llvm_ops_exceptions.c
         src/llvm/llvm_ops_misc.c
+        src/llvm/llvm_link.cpp
         src/code.c
     )
 
@@ -301,20 +302,44 @@ if(WITH_LLVM_AOT)
         PRIVATE
             src
             ${LLVM_INCLUDE_DIRS}
+            /usr/include  # for lld headers
     )
 
-    # Get LLVM libraries
+    # Get LLVM libraries (includes LLD ELF linker deps)
     llvm_map_components_to_libnames(LLVM_LIBS
         core
         analysis
         bitwriter
         target
+        codegen
+        debuginfodwarf
+        demangle
+        lto
+        mc
+        object
+        option
+        passes
+        support
+        targetparser
+        transformutils
+        binaryformat
         ${LLVM_TARGETS_TO_BUILD}
     )
+
+    # Find LLD libraries for --link support
+    # Prefer static .a to avoid pulling in libLLVM.so dynamically
+    find_library(LLD_ELF_LIB NAMES liblldELF.a lldELF
+        PATHS ${LLD_LIBRARY_DIR} ${LLVM_LIBRARY_DIRS}
+        NO_DEFAULT_PATH)
+    find_library(LLD_COMMON_LIB NAMES liblldCommon.a lldCommon
+        PATHS ${LLD_LIBRARY_DIR} ${LLVM_LIBRARY_DIRS}
+        NO_DEFAULT_PATH)
 
     target_link_libraries(hl2llvm
         libhl
         ${LLVM_LIBS}
+        ${LLD_ELF_LIB}
+        ${LLD_COMMON_LIB}
     )
 
     if(APPLE)
