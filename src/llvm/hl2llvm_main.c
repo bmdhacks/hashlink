@@ -44,6 +44,7 @@
  *   --rss          Report memory usage (RSS) per batch
  *   --batch        Batched compilation (~200 functions/batch)
  *   --batch-size=N Custom batch size
+ *   --threads=N    Parallel processes for batch compilation (default: auto)
  *   --link         Link object files into executable (requires --batch)
  *   -L <dir>       Add library search path (for --link)
  *   --help         Show this help
@@ -54,6 +55,7 @@
 #include <string.h>
 #include <stdbool.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <libgen.h>
 #include <errno.h>
 #include <unistd.h>
@@ -102,6 +104,7 @@ static void print_usage(const char *prog) {
     printf("  --rss          Report memory usage (RSS) per batch\n");
     printf("  --batch        Batched compilation (~200 functions/batch)\n");
     printf("  --batch-size=N Custom batch size (minimum 10)\n");
+    printf("  --threads=N    Parallel processes for batch compilation (0=auto)\n");
     printf("  --link         Link object files into executable (requires --batch)\n");
     printf("  -L <dir>       Add library search path (for --link)\n");
     printf("  --help         Show this help\n");
@@ -116,6 +119,7 @@ int main(int argc, char **argv) {
     bool verbose = false;
     bool report_rss = false;
     int batch_size = 0;  /* 0 = single file, >0 = batched mode */
+    int thread_count = 0;  /* 0 = auto-detect CPU count */
     int inline_threshold = 0;  /* 0 = use LLVM default */
     int fast_math = 0;         /* 0=off, 1=safe, 2=full */
     bool do_link = false;
@@ -164,6 +168,9 @@ int main(int argc, char **argv) {
         } else if (strncmp(argv[i], "--batch-size=", 13) == 0) {
             batch_size = atoi(argv[i] + 13);
             if (batch_size < 10) batch_size = 10;  /* Minimum batch size */
+        } else if (strncmp(argv[i], "--threads=", 10) == 0) {
+            thread_count = atoi(argv[i] + 10);
+            if (thread_count < 0) thread_count = 0;
         } else if (strncmp(argv[i], "--inline-threshold=", 19) == 0) {
             inline_threshold = atoi(argv[i] + 19);
             if (inline_threshold < 0) inline_threshold = 0;
@@ -364,152 +371,223 @@ int main(int argc, char **argv) {
         fprintf(manifest, "# hl2llvm batch compilation manifest\n");
         fprintf(manifest, "# Link with: clang @%s -lhl -o output\n", manifest_path);
 
-        if (verbose) {
-            printf("Batch compilation: %d functions, %d batches of %d\n",
-                   code->nfunctions, num_batches, batch_size);
+        /* Pre-compute all shared lazy state before threading.
+         * These functions cache results in shared structures without locking,
+         * so we must populate caches before any parallel access. */
+
+        /* hl_get_ustring: caches UTF-16 conversions in code->ustrings[] */
+        for (int i = 0; i < code->nstrings; i++) {
+            hl_get_ustring(code, i);
         }
 
-        /* Compile each batch + final */
-        for (int batch = 0; batch <= num_batches; batch++) {
-            llvm_ctx *ctx = llvm_create_context();
-            if (!ctx) {
-                fprintf(stderr, "Error: Failed to create LLVM context for batch %d\n", batch);
-                fclose(manifest);
-                hl_free(&module_ctx.alloc);
-                free(module_ctx.functions_types);
-                free(fdata);
-                hl_code_free(code);
-                _exit(1);
+        /* hl_get_obj_rt: caches runtime object info (field offsets, sizes).
+         * While it uses hl_global_lock internally, pre-computing avoids lock
+         * contention and shared allocator access during threaded compilation. */
+        for (int i = 0; i < code->ntypes; i++) {
+            hl_type *t = &code->types[i];
+            if ((t->kind == HOBJ || t->kind == HSTRUCT) && t->obj) {
+                hl_get_obj_rt(t);
             }
+        }
 
-            ctx->opt_level = opt_level;
-            ctx->emit_debug_info = emit_debug;
-            ctx->inline_threshold = inline_threshold;
-            ctx->fast_math = fast_math;
-            ctx->target_cpu = target_cpu;
-            ctx->target_features = target_features;
-            ctx->bytecode_data = (unsigned char *)fdata;
-            ctx->bytecode_size = size;
+        /* Determine process count for parallel compilation.
+         * We use fork() rather than threads because LLVM's pass managers
+         * (both legacy and new) have global state that is not thread-safe.
+         * fork() gives each child its own address space, completely isolating
+         * LLVM state, while sharing read-only data (hl_code, pre-computed
+         * caches) via copy-on-write pages at no extra memory cost. */
+        int total_work = num_batches + 1;  /* function batches + final */
+        int max_procs = thread_count;
+        if (max_procs <= 0) {
+            long nproc = sysconf(_SC_NPROCESSORS_ONLN);
+            max_procs = nproc > 0 ? (int)nproc : 1;
+        }
+        if (max_procs > total_work) max_procs = total_work;
 
-            if (batch < num_batches) {
-                /* Function batch */
-                ctx->batch_mode = (batch == 0) ? LLVM_BATCH_FIRST : LLVM_BATCH_SUBSEQUENT;
-                ctx->batch_start = batch * batch_size;
-                ctx->batch_end = (batch + 1) * batch_size;
-                if (ctx->batch_end > code->nfunctions)
-                    ctx->batch_end = code->nfunctions;
-            } else {
-                /* Final batch: entry point only */
-                ctx->batch_mode = LLVM_BATCH_FINAL;
-                ctx->batch_start = 0;
-                ctx->batch_end = 0;
-            }
+        if (verbose) {
+            printf("Batch compilation: %d functions, %d batches of %d, %d process%s\n",
+                   code->nfunctions, num_batches, batch_size,
+                   max_procs, max_procs > 1 ? "es" : "");
+        }
 
-            char batch_name[64];
-            snprintf(batch_name, sizeof(batch_name), "batch_%d", batch);
+        /* Fork child processes to compile batches in parallel */
+        int running = 0;
+        bool any_failed = false;
 
-            if (verbose) {
-                if (ctx->batch_mode == LLVM_BATCH_FINAL) {
-                    printf("  Batch %d/%d: entry point (final)\n", batch + 1, num_batches + 1);
-                } else {
-                    printf("  Batch %d/%d: functions %d-%d\n", batch + 1, num_batches + 1,
-                           ctx->batch_start, ctx->batch_end - 1);
+        for (int batch = 0; batch < total_work; batch++) {
+            /* Wait for a slot if at capacity */
+            while (running >= max_procs) {
+                int status;
+                pid_t done = waitpid(-1, &status, 0);
+                if (done > 0) {
+                    running--;
+                    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+                        if (WIFSIGNALED(status)) {
+                            fprintf(stderr, "Error: Child killed by signal %d\n",
+                                    WTERMSIG(status));
+                        }
+                        any_failed = true;
+                    }
+                } else if (done == -1 && errno != EINTR) {
+                    /* ECHILD: no children to wait for (shouldn't happen) */
+                    break;
                 }
+                /* EINTR: retry */
             }
 
-            if (!llvm_init_module(ctx, code, batch_name)) {
-                fprintf(stderr, "Error: Failed to init module for batch %d: %s\n",
-                        batch, ctx->error_msg ? ctx->error_msg : "unknown error");
-                llvm_destroy_context(ctx);
-                fclose(manifest);
-                hl_free(&module_ctx.alloc);
-                free(module_ctx.functions_types);
-                free(fdata);
-                hl_code_free(code);
-                _exit(1);
+            if (any_failed) break;
+
+            pid_t pid = fork();
+            if (pid < 0) {
+                fprintf(stderr, "Error: fork() failed for batch %d: %s\n",
+                        batch, strerror(errno));
+                any_failed = true;
+                break;
             }
 
-            if (ctx->batch_mode != LLVM_BATCH_FINAL) {
-                /* Compile functions in this batch */
-                for (int i = ctx->batch_start; i < ctx->batch_end; i++) {
-                    if (!llvm_compile_function(ctx, &code->functions[i])) {
-                        fprintf(stderr, "Error: Failed to compile function %d: %s\n",
-                                i, ctx->error_msg ? ctx->error_msg : "unknown error");
-                        llvm_destroy_context(ctx);
-                        fclose(manifest);
-                        hl_free(&module_ctx.alloc);
-                        free(module_ctx.functions_types);
-                        free(fdata);
-                        hl_code_free(code);
+            if (pid == 0) {
+                /* ---- Child process: compile one batch ---- */
+                fclose(manifest);  /* Child doesn't write manifest */
+
+                llvm_ctx *ctx = llvm_create_context();
+                if (!ctx) {
+                    fprintf(stderr, "Error: Failed to create LLVM context for batch %d\n", batch);
+                    _exit(1);
+                }
+
+                ctx->opt_level = opt_level;
+                ctx->emit_debug_info = emit_debug;
+                ctx->inline_threshold = inline_threshold;
+                ctx->fast_math = fast_math;
+                ctx->target_cpu = target_cpu;
+                ctx->target_features = target_features;
+                ctx->bytecode_data = (unsigned char *)fdata;
+                ctx->bytecode_size = size;
+
+                if (batch < num_batches) {
+                    ctx->batch_mode = (batch == 0) ? LLVM_BATCH_FIRST : LLVM_BATCH_SUBSEQUENT;
+                    ctx->batch_start = batch * batch_size;
+                    ctx->batch_end = (batch + 1) * batch_size;
+                    if (ctx->batch_end > code->nfunctions)
+                        ctx->batch_end = code->nfunctions;
+                } else {
+                    ctx->batch_mode = LLVM_BATCH_FINAL;
+                    ctx->batch_start = 0;
+                    ctx->batch_end = 0;
+                }
+
+                char batch_name[64];
+                snprintf(batch_name, sizeof(batch_name), "batch_%d", batch);
+
+                if (verbose) {
+                    if (ctx->batch_mode == LLVM_BATCH_FINAL) {
+                        printf("  Batch %d/%d: entry point (final)\n",
+                               batch + 1, total_work);
+                    } else {
+                        printf("  Batch %d/%d: functions %d-%d\n",
+                               batch + 1, total_work,
+                               ctx->batch_start, ctx->batch_end - 1);
+                    }
+                }
+
+                if (!llvm_init_module(ctx, code, batch_name)) {
+                    fprintf(stderr, "Error: Batch %d init failed: %s\n",
+                            batch, ctx->error_msg ? ctx->error_msg : "unknown");
+                    _exit(1);
+                }
+
+                if (ctx->batch_mode != LLVM_BATCH_FINAL) {
+                    for (int i = ctx->batch_start; i < ctx->batch_end; i++) {
+                        if (!llvm_compile_function(ctx, &code->functions[i])) {
+                            fprintf(stderr, "Error: Function %d failed: %s\n",
+                                    i, ctx->error_msg ? ctx->error_msg : "unknown");
+                            _exit(1);
+                        }
+                    }
+                } else {
+                    if (!llvm_generate_entry_point(ctx, code->entrypoint)) {
+                        fprintf(stderr, "Error: Entry point failed: %s\n",
+                                ctx->error_msg ? ctx->error_msg : "unknown");
                         _exit(1);
                     }
                 }
-            } else {
-                /* Generate entry point */
-                if (!llvm_generate_entry_point(ctx, code->entrypoint)) {
-                    fprintf(stderr, "Error: Failed to generate entry point: %s\n",
-                            ctx->error_msg ? ctx->error_msg : "unknown error");
-                    llvm_destroy_context(ctx);
-                    fclose(manifest);
-                    hl_free(&module_ctx.alloc);
-                    free(module_ctx.functions_types);
-                    free(fdata);
-                    hl_code_free(code);
+
+                llvm_finalize_module(ctx);
+
+                if (!llvm_verify(ctx)) {
+                    fprintf(stderr, "Error: Batch %d verify failed: %s\n",
+                            batch, ctx->error_msg ? ctx->error_msg : "unknown");
                     _exit(1);
                 }
-            }
 
-            llvm_finalize_module(ctx);
-
-            if (!llvm_verify(ctx)) {
-                fprintf(stderr, "Error: Batch %d verification failed: %s\n",
-                        batch, ctx->error_msg ? ctx->error_msg : "unknown error");
-                llvm_destroy_context(ctx);
-                fclose(manifest);
-                hl_free(&module_ctx.alloc);
-                free(module_ctx.functions_types);
-                free(fdata);
-                hl_code_free(code);
-                _exit(1);
-            }
-
-            if (opt_level > LLVM_OPT_NONE) {
-                llvm_optimize(ctx);
-            }
-
-            /* Output batch .o file */
-            char batch_file[4096];
-            if (ctx->batch_mode == LLVM_BATCH_FINAL) {
-                snprintf(batch_file, sizeof(batch_file), "%s/final.o", output_dir);
-            } else {
-                snprintf(batch_file, sizeof(batch_file), "%s/batch.%d.o", output_dir, batch + 1);
-            }
-
-            if (!llvm_output(ctx, batch_file, format)) {
-                fprintf(stderr, "Error: Failed to write batch %d: %s\n",
-                        batch, ctx->error_msg ? ctx->error_msg : "unknown error");
-                llvm_destroy_context(ctx);
-                fclose(manifest);
-                hl_free(&module_ctx.alloc);
-                free(module_ctx.functions_types);
-                free(fdata);
-                hl_code_free(code);
-                _exit(1);
-            }
-
-            fprintf(manifest, "%s\n", batch_file);
-
-            if (report_rss) {
-                long rss = get_rss_kb();
-                if (rss > 0) {
-                    printf("  Batch %d RSS: %ld MB\n", batch + 1, rss / 1024);
+                if (opt_level > LLVM_OPT_NONE) {
+                    llvm_optimize(ctx);
                 }
+
+                char batch_file[4096];
+                if (ctx->batch_mode == LLVM_BATCH_FINAL) {
+                    snprintf(batch_file, sizeof(batch_file), "%s/final.o", output_dir);
+                } else {
+                    snprintf(batch_file, sizeof(batch_file), "%s/batch.%d.o",
+                             output_dir, batch + 1);
+                }
+
+                if (!llvm_output(ctx, batch_file, format)) {
+                    fprintf(stderr, "Error: Batch %d output failed: %s\n",
+                            batch, ctx->error_msg ? ctx->error_msg : "unknown");
+                    _exit(1);
+                }
+
+                if (report_rss) {
+                    long rss = get_rss_kb();
+                    if (rss > 0) {
+                        printf("  Batch %d RSS: %ld MB\n", batch + 1, rss / 1024);
+                    }
+                }
+
+                _exit(0);
             }
 
-            /* Free LLVM memory for next batch */
-            llvm_destroy_context(ctx);
+            /* Parent: track child */
+            running++;
         }
 
+        /* Wait for remaining children */
+        while (running > 0) {
+            int status;
+            pid_t done = waitpid(-1, &status, 0);
+            if (done > 0) {
+                running--;
+                if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+                    if (WIFSIGNALED(status)) {
+                        fprintf(stderr, "Error: Child killed by signal %d\n",
+                                WTERMSIG(status));
+                    }
+                    any_failed = true;
+                }
+            } else if (done == -1 && errno != EINTR) {
+                /* ECHILD: no children left despite running > 0.
+                 * Can happen if SIGCHLD is SIG_IGN (auto-reap). */
+                break;
+            }
+            /* EINTR: retry */
+        }
+
+        if (any_failed) {
+            fprintf(stderr, "Error: Batch compilation failed\n");
+            fclose(manifest);
+            hl_free(&module_ctx.alloc);
+            free(module_ctx.functions_types);
+            free(fdata);
+            hl_code_free(code);
+            _exit(1);
+        }
+
+        /* Write manifest — filenames are deterministic */
+        for (int batch = 0; batch < num_batches; batch++) {
+            fprintf(manifest, "%s/batch.%d.o\n", output_dir, batch + 1);
+        }
+        fprintf(manifest, "%s/final.o\n", output_dir);
         fclose(manifest);
 
         if (verbose) {

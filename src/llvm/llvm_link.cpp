@@ -64,6 +64,46 @@ static std::string find_aot_runtime(const std::vector<std::string> &dirs) {
     return "";
 }
 
+/* Find a shared library by name, searching user dirs first (supports versioned .so.N).
+ * Looks for: lib<name>.so, lib<name>.so.* in user dirs, then system dirs.
+ * Returns full path or empty string. */
+static std::string find_lib(const char *name, const std::vector<std::string> &user_dirs) {
+    std::string prefix = std::string("lib") + name + ".so";
+    /* Search user dirs first, then system dirs */
+    const char *sys_dirs[] = {
+        "/lib64", "/usr/lib64",
+        "/lib/aarch64-linux-gnu", "/usr/lib/aarch64-linux-gnu",
+        "/lib", "/usr/lib",
+        nullptr
+    };
+    std::vector<std::string> all_dirs(user_dirs);
+    for (const char **p = sys_dirs; *p; p++)
+        all_dirs.push_back(*p);
+
+    for (const auto &dir : all_dirs) {
+        /* Try exact match first (unversioned symlink) */
+        std::string exact = dir + "/" + prefix;
+        std::ifstream test_exact(exact);
+        if (test_exact.good())
+            return exact;
+
+        /* Scan directory for versioned variants (e.g., libhl.so.1) */
+        DIR *d = opendir(dir.c_str());
+        if (!d) continue;
+        struct dirent *entry;
+        while ((entry = readdir(d)) != nullptr) {
+            std::string fname(entry->d_name);
+            /* Match lib<name>.so.* */
+            if (fname.size() > prefix.size() && fname.substr(0, prefix.size() + 1) == prefix + ".") {
+                closedir(d);
+                return dir + "/" + fname;
+            }
+        }
+        closedir(d);
+    }
+    return "";
+}
+
 /* Find CRT objects (crt1.o, crti.o, crtn.o) needed for a proper executable */
 static std::string find_crt(const char *name) {
     const char *search_paths[] = {
@@ -162,13 +202,19 @@ int llvm_lld_link_elf(const char *manifest_path, const char *output_path,
     str_args.push_back("-L/lib");
     str_args.push_back("-L/usr/lib");
 
-    /* Required shared libraries */
-    str_args.push_back("-lhl");
-    str_args.push_back("-lm");
-    str_args.push_back("-ldl");
-    str_args.push_back("-lpthread");
-    str_args.push_back("-luv");
-    str_args.push_back("-lc");
+    /* Required shared libraries.
+     * Try to resolve full paths from user dirs first (supports versioned
+     * .so.N files on filesystems without symlinks like vfat).
+     * Falls back to -l flag for system library search. */
+    const char *needed_libs[] = {"hl", "m", "dl", "pthread", "uv", "c", nullptr};
+    for (const char **lib = needed_libs; *lib; lib++) {
+        std::string path = find_lib(*lib, user_dirs);
+        if (!path.empty()) {
+            str_args.push_back(path);
+        } else {
+            str_args.push_back(std::string("-l") + *lib);
+        }
+    }
 
     /* hdll files — ELF shared objects with non-standard extension */
     for (const auto &dir : user_dirs) {

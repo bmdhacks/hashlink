@@ -24,6 +24,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <pthread.h>
 
 /* Forward declarations */
 static void compile_opcode(llvm_ctx *ctx, hl_function *f, hl_opcode *op, int op_idx);
@@ -31,14 +32,23 @@ static void scan_for_blocks(llvm_ctx *ctx, hl_function *f);
 static void create_basic_blocks(llvm_ctx *ctx, hl_function *f);
 static void create_function_allocas(llvm_ctx *ctx, hl_function *f);
 
+/* LLVM target initialization must happen exactly once, even when
+ * llvm_create_context() is called from multiple threads. The underlying
+ * LLVMInitialize* functions modify a global target registry that is
+ * not safe to call concurrently. */
+static pthread_once_t llvm_init_once = PTHREAD_ONCE_INIT;
+static void llvm_init_targets(void) {
+    LLVMInitializeNativeTarget();
+    LLVMInitializeNativeAsmPrinter();
+    LLVMInitializeNativeAsmParser();
+}
+
 llvm_ctx *llvm_create_context(void) {
     llvm_ctx *ctx = (llvm_ctx *)calloc(1, sizeof(llvm_ctx));
     if (!ctx) return NULL;
 
-    /* Initialize LLVM targets */
-    LLVMInitializeNativeTarget();
-    LLVMInitializeNativeAsmPrinter();
-    LLVMInitializeNativeAsmParser();
+    /* Initialize LLVM targets (thread-safe, runs exactly once) */
+    pthread_once(&llvm_init_once, llvm_init_targets);
 
     /* Create LLVM context */
     ctx->context = LLVMContextCreate();
