@@ -81,32 +81,37 @@ static std::string find_lib(const char *name, const std::vector<std::string> &us
         all_dirs.push_back(*p);
 
     for (const auto &dir : all_dirs) {
-        /* Try exact match first (unversioned symlink) */
+        /* Try versioned variants first (e.g., libhl.so.1, libc.so.6) —
+         * these are always real shared libraries, unlike unversioned .so
+         * which may be linker scripts with hardcoded absolute paths
+         * (e.g., libc.so references libc_nonshared.a at paths that
+         * don't exist on the target device). */
+        DIR *d = opendir(dir.c_str());
+        if (d) {
+            struct dirent *entry;
+            while ((entry = readdir(d)) != nullptr) {
+                std::string fname(entry->d_name);
+                /* Match lib<name>.so.* */
+                if (fname.size() > prefix.size() && fname.substr(0, prefix.size() + 1) == prefix + ".") {
+                    closedir(d);
+                    return dir + "/" + fname;
+                }
+            }
+            closedir(d);
+        }
+
+        /* Fall back to unversioned .so */
         std::string exact = dir + "/" + prefix;
         std::ifstream test_exact(exact);
         if (test_exact.good())
             return exact;
-
-        /* Scan directory for versioned variants (e.g., libhl.so.1) */
-        DIR *d = opendir(dir.c_str());
-        if (!d) continue;
-        struct dirent *entry;
-        while ((entry = readdir(d)) != nullptr) {
-            std::string fname(entry->d_name);
-            /* Match lib<name>.so.* */
-            if (fname.size() > prefix.size() && fname.substr(0, prefix.size() + 1) == prefix + ".") {
-                closedir(d);
-                return dir + "/" + fname;
-            }
-        }
-        closedir(d);
     }
     return "";
 }
 
 /* Find CRT objects (crt1.o, crti.o, crtn.o) needed for a proper executable */
-static std::string find_crt(const char *name) {
-    const char *search_paths[] = {
+static std::string find_crt(const char *name, const std::vector<std::string> &user_dirs) {
+    const char *sys_paths[] = {
         "/usr/lib64",
         "/usr/lib/aarch64-linux-gnu",
         "/usr/lib",
@@ -115,7 +120,14 @@ static std::string find_crt(const char *name) {
         "/lib",
         nullptr
     };
-    for (const char **p = search_paths; *p; p++) {
+    /* Search user dirs first, then system dirs */
+    for (const auto &dir : user_dirs) {
+        std::string path = dir + "/" + name;
+        std::ifstream test(path);
+        if (test.good())
+            return path;
+    }
+    for (const char **p = sys_paths; *p; p++) {
         std::string path = std::string(*p) + "/" + name;
         std::ifstream test(path);
         if (test.good())
@@ -170,11 +182,18 @@ int llvm_lld_link_elf(const char *manifest_path, const char *output_path,
     str_args.push_back(output_path);
 
     /* CRT startup objects */
-    std::string crt1 = find_crt("crt1.o");
-    std::string crti = find_crt("crti.o");
-    std::string crtn = find_crt("crtn.o");
-    if (!crt1.empty()) str_args.push_back(crt1);
-    if (!crti.empty()) str_args.push_back(crti);
+    std::string crt1 = find_crt("crt1.o", user_dirs);
+    std::string crti = find_crt("crti.o", user_dirs);
+    std::string crtn = find_crt("crtn.o", user_dirs);
+    if (crt1.empty() || crti.empty() || crtn.empty()) {
+        fprintf(stderr, "Error: Missing CRT objects (crt1.o=%s, crti.o=%s, crtn.o=%s)\n",
+                crt1.empty() ? "NOT FOUND" : crt1.c_str(),
+                crti.empty() ? "NOT FOUND" : crti.c_str(),
+                crtn.empty() ? "NOT FOUND" : crtn.c_str());
+        return 1;
+    }
+    str_args.push_back(crt1);
+    str_args.push_back(crti);
 
     /* All object files from manifest */
     for (const auto &obj : obj_files)
@@ -203,10 +222,12 @@ int llvm_lld_link_elf(const char *manifest_path, const char *output_path,
     str_args.push_back("-L/usr/lib");
 
     /* Required shared libraries.
-     * Try to resolve full paths from user dirs first (supports versioned
+     * Resolve full paths for runtime libs from user dirs (supports versioned
      * .so.N files on filesystems without symlinks like vfat).
-     * Falls back to -l flag for system library search. */
-    const char *needed_libs[] = {"hl", "m", "dl", "pthread", "uv", "c", nullptr};
+     * System libs (libc, libm, etc.) always use -l flags to avoid picking up
+     * linker scripts with hardcoded absolute paths (e.g., libc.so references
+     * libc_nonshared.a at build-host paths that don't exist on target). */
+    const char *needed_libs[] = {"hl", "m", "uv", "c", nullptr};
     for (const char **lib = needed_libs; *lib; lib++) {
         std::string path = find_lib(*lib, user_dirs);
         if (!path.empty()) {
@@ -215,6 +236,28 @@ int llvm_lld_link_elf(const char *manifest_path, const char *output_path,
             str_args.push_back(std::string("-l") + *lib);
         }
     }
+
+    /* libc_nonshared.a — provides atexit, __stack_chk_fail_local, etc.
+     * Normally pulled in by the libc.so linker script, but since we link
+     * libc.so.6 directly (to avoid broken linker scripts on some distros),
+     * we need to provide it explicitly. */
+    std::string nonshared;
+    for (const auto &dir : user_dirs) {
+        std::string path = dir + "/libc_nonshared.a";
+        std::ifstream test(path);
+        if (test.good()) { nonshared = path; break; }
+    }
+    if (nonshared.empty()) {
+        const char *sys[] = {"/usr/lib64", "/usr/lib/aarch64-linux-gnu",
+                             "/usr/lib", "/lib64", "/lib", nullptr};
+        for (const char **p = sys; *p; p++) {
+            std::string path = std::string(*p) + "/libc_nonshared.a";
+            std::ifstream test(path);
+            if (test.good()) { nonshared = path; break; }
+        }
+    }
+    if (!nonshared.empty())
+        str_args.push_back(nonshared);
 
     /* hdll files — ELF shared objects with non-standard extension */
     for (const auto &dir : user_dirs) {
