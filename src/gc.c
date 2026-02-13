@@ -32,6 +32,8 @@
 #	include <emscripten/heap.h>
 #endif
 
+#include "gc_trace.h"
+
 #if defined(HL_VCC)
 #define DRAM_PREFETCH(addr) _mm_prefetch(p, 1)
 #elif defined(HL_CLANG) || defined (HL_GCC)
@@ -562,6 +564,7 @@ void *hl_gc_alloc_gen( hl_type *t, int size, int flags ) {
 	memset((char*)ptr+(allocated - HL_WSIZE),0xEE,HL_WSIZE);
 #	endif
 	gc_global_lock(false);
+	if (gc_trace_active) gc_trace_alloc(ptr, allocated);
 	hl_track_call(HL_TRACK_ALLOC, on_alloc(t,size,flags,ptr));
 	return ptr;
 }
@@ -1174,10 +1177,12 @@ void hl_cache_init();
 
 void hl_global_init() {
 	hl_gc_init();
+	gc_trace_init();
 	hl_cache_init();
 }
 
 void hl_global_free() {
+	gc_trace_close();
 	hl_hb_dump_presize_info();
 	hl_cache_free();
 	hl_gc_free();

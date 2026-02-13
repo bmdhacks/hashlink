@@ -222,6 +222,7 @@ static void flush_free_list( gc_pheader *ph ) {
 		} else
 			count = 1;
 		if( (bmp[bid>>3] & (1<<(bid&7))) == 0 ) {
+			if (gc_trace_active) gc_trace_free(ph->base + bid * p->block_size);
 			if( p->sizes ) p->sizes[bid] = 0;
 			if( cur_pos && cur_pos->pos + cur_pos->count == bid )
 				cur_pos->count += count;
@@ -423,6 +424,42 @@ static bool is_zero( void *ptr, int size ) {
 	return memcmp(p,ZEROMEM,size) == 0;
 }
 
+static void gc_trace_free_page_blocks(gc_pheader *ph) {
+	gc_allocator_page_data *p = &ph->alloc;
+	if( p->sizes ) {
+		int bid = p->first_block;
+		while( bid < p->max_blocks ) {
+			if( p->sizes[bid] ) {
+				gc_trace_free(ph->base + bid * p->block_size);
+				bid += p->sizes[bid];
+			} else {
+				bid++;
+			}
+		}
+	} else {
+		gc_freelist *fl = &p->free;
+		int fl_idx = fl->current;
+		int bid = p->first_block;
+		while( bid < p->max_blocks ) {
+			if( fl_idx < fl->count ) {
+				gc_fl *entry = GET_FL(fl, fl_idx);
+				if( bid < entry->pos ) {
+					gc_trace_free(ph->base + bid * p->block_size);
+					bid++;
+				} else if( bid < entry->pos + entry->count ) {
+					bid = entry->pos + entry->count;
+					fl_idx++;
+				} else {
+					fl_idx++;
+				}
+			} else {
+				gc_trace_free(ph->base + bid * p->block_size);
+				bid++;
+			}
+		}
+	}
+}
+
 static void gc_flush_empty_pages() {
 	int i;
 	for(i=0;i<GC_ALL_PAGES;i++) {
@@ -432,6 +469,7 @@ static void gc_flush_empty_pages() {
 			gc_allocator_page_data *p = &ph->alloc;
 			gc_pheader *next = ph->next_page;
 			if( ph->bmp && is_zero(ph->bmp+(p->first_block>>3),((p->max_blocks+7)>>3) - (p->first_block>>3)) ) {
+				if (gc_trace_active) gc_trace_free_page_blocks(ph);
 				if( prev )
 					prev->next_page = next;
 				else
@@ -728,6 +766,19 @@ static void gc_allocator_after_mark() {
 #	endif
 	gc_flush_empty_pages();
 	gc_madvise_free_regions();
+	if (gc_trace_active) {
+		// Force eager free-list rebuild on all pages so tracer sees
+		// frees at GC time rather than at next allocation.
+		int pid;
+		for(pid=0;pid<GC_ALL_PAGES;pid++) {
+			gc_pheader *ph = gc_pages[pid];
+			while( ph ) {
+				if( ph->alloc.need_flush )
+					flush_free_list(ph);
+				ph = ph->next_page;
+			}
+		}
+	}
 }
 
 static void gc_get_stats( int *page_count, int *private_data ) {

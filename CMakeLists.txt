@@ -157,6 +157,7 @@ endif()
 add_library(libhl
     ${pcre_srcs}
     src/gc.c
+    src/gc_trace.c
     ${std_srcs}
 )
 
