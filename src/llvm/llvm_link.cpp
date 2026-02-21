@@ -227,7 +227,7 @@ int llvm_lld_link_elf(const char *manifest_path, const char *output_path,
      * System libs (libc, libm, etc.) always use -l flags to avoid picking up
      * linker scripts with hardcoded absolute paths (e.g., libc.so references
      * libc_nonshared.a at build-host paths that don't exist on target). */
-    const char *needed_libs[] = {"hl", "m", "uv", "c", nullptr};
+    const char *needed_libs[] = {"hl", "m", "uv", "dl", "pthread", "c", nullptr};
     for (const char **lib = needed_libs; *lib; lib++) {
         std::string path = find_lib(*lib, user_dirs);
         if (!path.empty()) {
