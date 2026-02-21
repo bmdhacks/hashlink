@@ -303,7 +303,7 @@ if(WITH_LLVM_AOT)
         PRIVATE
             src
             ${LLVM_INCLUDE_DIRS}
-            /usr/include  # for lld headers
+            ${LLD_INCLUDE_DIR}  # for lld headers
     )
 
     # Get LLVM libraries (includes LLD ELF linker deps)
@@ -341,6 +341,8 @@ if(WITH_LLVM_AOT)
         ${LLVM_LIBS}
         ${LLD_ELF_LIB}
         ${LLD_COMMON_LIB}
+        -static-libstdc++
+        -static-libgcc
     )
 
     if(APPLE)
