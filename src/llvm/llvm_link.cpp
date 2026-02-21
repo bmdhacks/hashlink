@@ -207,11 +207,11 @@ int llvm_lld_link_elf(const char *manifest_path, const char *output_path,
         fprintf(stderr, "Warning: libaot_runtime.a not found in library paths\n");
     }
 
-    /* User library search paths + rpath */
+    /* User library search paths + portable rpath */
     for (const auto &dir : user_dirs) {
         str_args.push_back("-L" + dir);
-        str_args.push_back("-rpath=" + dir);
     }
+    str_args.push_back("-rpath=$ORIGIN");
 
     /* System library search paths */
     str_args.push_back("-L/lib64");
@@ -231,7 +231,12 @@ int llvm_lld_link_elf(const char *manifest_path, const char *output_path,
     for (const char **lib = needed_libs; *lib; lib++) {
         std::string path = find_lib(*lib, user_dirs);
         if (!path.empty()) {
-            str_args.push_back(path);
+            /* Extract filename, use -l: syntax to avoid embedding absolute
+             * paths in DT_NEEDED entries. -l:filename matches the exact
+             * filename in -L search paths (works with versioned .so.N). */
+            size_t slash = path.rfind('/');
+            std::string name = (slash != std::string::npos) ? path.substr(slash + 1) : path;
+            str_args.push_back("-l:" + name);
         } else {
             str_args.push_back(std::string("-l") + *lib);
         }
@@ -259,11 +264,15 @@ int llvm_lld_link_elf(const char *manifest_path, const char *output_path,
     if (!nonshared.empty())
         str_args.push_back(nonshared);
 
-    /* hdll files — ELF shared objects with non-standard extension */
+    /* hdll files — ELF shared objects with non-standard extension.
+     * Use -l:filename to avoid embedding absolute paths in DT_NEEDED. */
     for (const auto &dir : user_dirs) {
         auto hdlls = find_hdlls(dir);
-        for (const auto &hdll : hdlls)
-            str_args.push_back(hdll);
+        for (const auto &hdll : hdlls) {
+            size_t slash = hdll.rfind('/');
+            std::string name = (slash != std::string::npos) ? hdll.substr(slash + 1) : hdll;
+            str_args.push_back("-l:" + name);
+        }
     }
 
     /* CRT finalization */
