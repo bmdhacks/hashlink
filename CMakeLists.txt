@@ -64,6 +64,11 @@ list(APPEND CMAKE_MODULE_PATH
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
+# Frame pointers required for gc_trace (heaptrack) stack walking through C→JIT boundary
+if(NOT MSVC)
+    add_compile_options(-fno-omit-frame-pointer)
+endif()
+
 # put output in "bin"
 
 set(OUTPUT_DIR ${CMAKE_CURRENT_BINARY_DIR}/bin)
