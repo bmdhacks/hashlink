@@ -512,7 +512,9 @@ struct _fmt_mp3 {
 };
 
 // Allocate MP3 reader.
-HL_PRIM fmt_mp3 *HL_NAME(mp3_open)() {
+// NB bytecode expects (bytes, i32) signature from older Heaps API.
+// The parameters are accepted but ignored — decoding happens in mp3_decode_frame.
+HL_PRIM fmt_mp3 *HL_NAME(mp3_open)( vbyte *bytes, int size ) {
 	fmt_mp3 *o = (fmt_mp3*)hl_gc_alloc_noptr(sizeof(fmt_mp3));
 	mp3dec_init(&o->dec);
 	return o;
@@ -587,7 +589,7 @@ HL_PRIM int HL_NAME(mp3_decode_frame)( fmt_mp3 *o, char *bytes, int size, int po
 
 #define _MP3 _ABSTRACT(fmt_mp3)
 
-DEFINE_PRIM(_MP3, mp3_open, _NO_ARG);
+DEFINE_PRIM(_MP3, mp3_open, _BYTES _I32);
 DEFINE_PRIM(_VOID, mp3_frame_info, _MP3 _REF(_I32) _REF(_I32) _REF(_I32) _REF(_I32) _REF(_I32))
 DEFINE_PRIM(_I32, mp3_decode_frame, _MP3 _BYTES _I32 _I32 _BYTES _I32 _I32);
 
