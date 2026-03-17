@@ -101,6 +101,36 @@ HL_PRIM int hl_hash_utf8( const char *name ) {
 HL_PRIM int hl_hash_gen( const uchar *name, bool cache_name ) {
 	int h = 0;
 	const uchar *oname = name;
+
+	// Fast path: interned string pointer cache.  HL string constants are
+	// interned so the same field name reuses the same pointer.  This
+	// eliminates the hash loop + mutex for repeated lookups (e.g. LDtk
+	// layer names hit from collision checks every frame).
+#	define HASH_PTR_CACHE_SIZE 8
+	static const uchar *_hpc_ptr[HASH_PTR_CACHE_SIZE];
+	static int _hpc_hash[HASH_PTR_CACHE_SIZE];
+	if( cache_name ) {
+		for( int i = 0; i < HASH_PTR_CACHE_SIZE; i++ ) {
+			if( _hpc_ptr[i] == name )
+				return _hpc_hash[i];
+		}
+	}
+
+#ifdef HL_HASH_DIAG
+	{
+		static int _hg_count = 0;
+		static int _hg_cache_count = 0;
+		if (cache_name) _hg_cache_count++;
+		if (++_hg_count % 200000 == 0) {
+			char buf[128];
+			int i;
+			for (i = 0; i < 127 && oname[i]; i++) buf[i] = (char)oname[i];
+			buf[i] = 0;
+			printf("[hash_gen] #%d (cached=%d) str='%s' cache=%d\n",
+			       _hg_count, _hg_cache_count, buf, cache_name);
+		}
+	}
+#endif
 	while( *name ) {
 		h = 223 * h + (unsigned)*name;
 		name++;
@@ -128,6 +158,13 @@ HL_PRIM int hl_hash_gen( const uchar *name, bool cache_name ) {
 			hl_lookup_insert(hl_cache,hl_cache_count++,h,(hl_type*)ustrdup(oname),0);
 		}
 		hl_mutex_release(hl_cache_lock);
+		// Fill pointer cache (FIFO eviction)
+		{
+			static int _hpc_next = 0;
+			_hpc_ptr[_hpc_next] = oname;
+			_hpc_hash[_hpc_next] = h;
+			_hpc_next = (_hpc_next + 1) % HASH_PTR_CACHE_SIZE;
+		}
 	}
 	return h;
 }
