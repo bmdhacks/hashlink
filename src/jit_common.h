@@ -122,6 +122,7 @@ struct _jit_ctx {
 	int ldp_positions[5];                 // CPU LDP positions
 	int stp_fpu_positions[4];             // FPU STP positions (4 pairs: V8-V15)
 	int ldp_fpu_positions[4];             // FPU LDP positions
+	int long_branches;                    // 1 if function is large enough to need long branches
 #endif
 };
 

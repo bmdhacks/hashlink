@@ -1429,8 +1429,42 @@ static void op_toufloat(jit_ctx *ctx, vreg *dst, vreg *src) {
  * Also mark the target opcode so we know to discard registers when we reach it
  */
 static void register_jump(jit_ctx *ctx, int pos, int target) {
+	int jump_pos = pos;
+
+	// For large functions, convert conditional branches (B.cond, CBZ/CBNZ)
+	// to a long-branch sequence: invert the condition to skip +8, then emit
+	// an unconditional B (26-bit range) to the real target.
+	// This avoids the ±1MB limit on 19-bit conditional branch offsets.
+	if (ctx->long_branches) {
+		unsigned int *code = (unsigned int*)(ctx->startBuf + pos);
+		unsigned int insn = *code;
+		unsigned int opc = (insn >> 24) & 0xFF;
+
+		if (opc == 0x54) {
+			// B.cond — invert condition (XOR bit 0) and set offset to +2 (skip 8 bytes)
+			*code = (insn ^ 0x1) | (0x2 << 5);  // cond inverted, imm19=2
+			*code = (*code & 0xFF00001F) | (0x2 << 5) | ((*code) & 0xF);
+			// Re-derive: keep opcode byte and inverted cond, set offset=+2
+			unsigned int inv_cond = (insn & 0xF) ^ 0x1;
+			*code = 0x54000000 | (0x2 << 5) | inv_cond;
+			// Emit unconditional B placeholder (will be patched)
+			jump_pos = BUF_POS();
+			EMIT32(ctx, 0x14000000);
+		} else if ((opc & 0x7E) == 0x34) {
+			// CBZ/CBNZ — invert (XOR bit 24) and set offset to +2
+			unsigned int sf = insn & (1u << 31);        // size bit
+			unsigned int rt = insn & 0x1F;               // register
+			unsigned int op_bit = (insn >> 24) & 1;      // 0=CBZ, 1=CBNZ
+			*code = sf | ((0x34 | (op_bit ^ 1)) << 24) | (0x2 << 5) | rt;
+			// Emit unconditional B placeholder
+			jump_pos = BUF_POS();
+			EMIT32(ctx, 0x14000000);
+		}
+		// Unconditional B (0x14/0x15) already has 26-bit range — no change needed
+	}
+
 	jlist *j = (jlist*)malloc(sizeof(jlist));
-	j->pos = pos;
+	j->pos = jump_pos;
 	j->target = target;
 	j->next = ctx->jumps;
 	ctx->jumps = j;
@@ -1458,7 +1492,8 @@ static void patch_jump(jit_ctx *ctx, int pos, int target_pos) {
 		// B.cond - 19-bit signed offset
 		// Range: ±1MB (±0x40000 instructions, ±0x100000 bytes)
 		if (insn_offset < -0x40000 || insn_offset >= 0x40000) {
-			printf("JIT Error: Conditional branch offset too large: %d\n", insn_offset);
+			printf("JIT Error: B.cond offset too large: %d insns (findex %d, %d ops)\n",
+				insn_offset, ctx->f->findex, ctx->f->nops);
 			JIT_ASSERT(0);
 		}
 		// Clear old offset, set new offset (bits 5-23)
@@ -4379,6 +4414,14 @@ int hl_jit_function(jit_ctx *ctx, hl_module *m, hl_function *f) {
 	ctx->f = f;
 	ctx->m = m;
 	ctx->allocOffset = 0;
+
+	// Functions with many opcodes can exceed the ±1MB conditional branch limit.
+	// Each opcode compiles to ~4-20 bytes; at ~4 bytes avg, 50K ops ≈ 200KB.
+	// Use long branches (inverted cond + unconditional B) for safety above 40K ops.
+	// Each HL opcode compiles to ~10-40 ARM64 instructions (avg ~25).
+	// The ±1MB conditional branch limit is ~262K instructions.
+	// Conservatively enable long branches above 8K ops (~200K instructions).
+	ctx->long_branches = (f->nops > 8000) ? 1 : 0;
 
 	// Allocate virtual register array if needed
 	// Always reallocate to ensure clean state (no stale data from previous functions)
