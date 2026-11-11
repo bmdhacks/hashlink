@@ -294,6 +294,28 @@ if(BUILD_TESTING)
     )
 
     #####################
+    # native_args.hl : native calls with stack arguments (more than 8 integer arguments, mixed sizes)
+
+    add_library(native_args.hdll SHARED other/tests/native_args.c)
+    set_target_properties(native_args.hdll PROPERTIES
+        PREFIX ""
+        OUTPUT_NAME native_args
+        SUFFIX .hdll
+        LIBRARY_OUTPUT_DIRECTORY ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}
+    )
+    target_link_libraries(native_args.hdll libhl)
+    add_custom_command(OUTPUT ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/test/native_args.hl
+        COMMAND ${HAXE_COMPILER}
+            ${HAXE_HL_FLAGS}
+            -hl ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/test/native_args.hl
+            -cp ${CMAKE_SOURCE_DIR}/other/tests -main NativeArgs
+    )
+    add_custom_target(native_args.hl ALL
+        DEPENDS ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/test/native_args.hl native_args.hdll
+    )
+
+    #####################
     # threads.hl
 
     add_custom_command(OUTPUT ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/test/threads.hl
@@ -420,6 +442,10 @@ if(BUILD_TESTING)
         )
         add_test(NAME threads.hl
             COMMAND hl ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/test/threads.hl
+        )
+        add_test(NAME native_args.hl
+            COMMAND hl ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/test/native_args.hl
+            WORKING_DIRECTORY ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}
         )
         add_test(NAME uvsample.hl
             COMMAND hl ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/test/uvsample.hl 6001
